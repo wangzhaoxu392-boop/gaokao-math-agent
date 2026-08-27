@@ -43,7 +43,7 @@ echo [1/2] Ollama 已就绪。
 
 :after_ollama
 echo [2/2] 正在启动网页服务（新窗口，关闭该窗口即停止服务）...
-start "高考数学Agent网页版" cmd /k ".\.venv\Scripts\python.exe math_agent_web.py"
+start "高考数学Agent网页版" cmd /k ""C:\Users\Administrator\Desktop\gaokao_math_agent\.venv\Scripts\python.exe" math_agent_web.py"
 
 timeout /t 8 /nobreak >nul
 start "" "http://127.0.0.1:7860"

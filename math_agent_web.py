@@ -58,10 +58,24 @@ def _list_files(folder, exts=None):
 
 
 # ==================== 功能1：单题交互 ====================
+# 固定会话ID实现跨题记忆（追问可衔接）；记忆上限由 solve_agent 的记忆窗口控制，不会无限膨胀
+_WEB_THREAD = "web_chat"
+
+def clear_memory():
+    try:
+        maa.graph_chat.update_state(
+            {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": 10},
+            {"messages": []})
+        return "✅ 记忆已清空，开始全新对话"
+    except Exception as e:
+        return f"清空失败：{e}"
+
 def solve_one(question):
     if not question or not question.strip():
-        return "请输入题目。", None
-    cfg = {"configurable": {"thread_id": "web_chat"}, "recursion_limit": 10}
+        yield "请输入题目。", None
+        return
+    yield "⏳ 正在解题中（简单题约1分钟，大题约3~5分钟），请勿关闭页面，耐心等待...", None
+    cfg = {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": 10}
     plot = OUTPUT_FOLDER / "plot_out.png"
     before = plot.stat().st_mtime if plot.exists() else None
     t0 = time.time()
@@ -69,7 +83,7 @@ def solve_one(question):
     dt = time.time() - t0
     after = plot.stat().st_mtime if plot.exists() else None
     img = str(plot) if (after and after != before) else None
-    return f"（本题用时 {dt:.0f} 秒）\n\n{ans}", img
+    yield f"（本题用时 {dt:.0f} 秒）\n\n{ans}", img
 
 
 # ==================== 功能2：RAG 知识库 ====================
@@ -145,7 +159,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
     # ---------- 功能1 ----------
     with gr.Tab("① 单题交互"):
         q_input = gr.Textbox(
-            label="输入题目（可含多小问，如“已知 f(x)=... (1)求... (2)证明...”）",
+            label="输入题目（可含多小问，如“已知 f(x)=... (1)求... (2)证明...”），支持追问，如“那它的极值呢”",
             lines=4, placeholder="例如：求函数 y = x^2 - 4x + 3 的单调区间和极值")
         with gr.Row():
             btn_solve = gr.Button("开始解答", variant="primary")
@@ -153,11 +167,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         out_text = gr.Textbox(label="解答结果", lines=20, interactive=False)
         out_plot = gr.Image(label="函数图像（如有）", type="filepath", visible=True)
         btn_solve.click(solve_one, inputs=[q_input], outputs=[out_text, out_plot])
-        btn_clear.click(
-            lambda: (maa.graph_chat.update_state(
-                {"configurable": {"thread_id": "web_chat"}, "recursion_limit": 10},
-                {"messages": []}), "✅ 记忆已清空")[1],
-            outputs=[out_text])
+        btn_clear.click(clear_memory, outputs=[out_text])
 
     # ---------- 功能2 ----------
     with gr.Tab("② RAG 知识库"):

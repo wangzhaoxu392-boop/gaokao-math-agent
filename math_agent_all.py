@@ -132,6 +132,14 @@ def load_rag_db():
     return None
 
 def rag_retrieve(query: str):
+    # 若 knowledge_docs 无任何可检索文档，直接跳过向量库检索，
+    # 避免每次解题都加载嵌入模型（nomic-embed-text）拖慢速度。
+    doc_files = [
+        f for f in Path(KNOWLEDGE_FOLDER).glob("*")
+        if f.is_file() and f.suffix.lower() in (".txt", ".md", ".docx", ".pdf")
+    ]
+    if not doc_files:
+        return "【RAG】无知识库文档"
     db = load_rag_db()
     if db is None:
         return "【RAG】无知识库文档"
@@ -164,14 +172,63 @@ def decompose_problem(state: MessagesState):
     resp = llm_fast.invoke([{"role":"user","content":decompose_prompt}])
     return {"messages":[{"role":"system","content":"【题目拆解】"+resp.content}]}
 
+def _recent_context(messages, max_rounds: int = 2):
+    """从对话状态中提取最近 max_rounds 轮『用户问+最终答』作为记忆上下文。
+    同一问多轮 AI 输出（解题/复核）只保留最后一次；忽略工具调用链与拆解系统消息。"""
+    turns = []
+    q = None
+    for m in messages:
+        t = getattr(m, "type", "")
+        if t == "human":
+            q = m.content
+        elif t == "ai" and not getattr(m, "tool_calls", None) and q is not None:
+            if turns and turns[-1][0] == q:
+                turns[-1] = (q, m.content)  # 同一问的最新回答（复核后版本）
+            else:
+                turns.append((q, m.content))
+    return turns[-max_rounds:]
+
+
+def _current_question_and_decompose(state):
+    """返回 (当前用户题目, 当前题目的拆解note)"""
+    msgs = state["messages"]
+    user_q = None
+    for m in reversed(msgs):
+        if getattr(m, "type", "") == "human":
+            user_q = m.content
+            break
+    decompose_note = None
+    for m in reversed(msgs):
+        if getattr(m, "type", "") == "system" and str(m.content).startswith("【题目拆解】"):
+            decompose_note = m.content
+            break
+    return user_q, decompose_note
+
+
+# 指代词：命中即认为当前问题可能引用上一题，需要把上一题拼进来保证题目自包含
+_REF_WORDS = re.compile(r"它|该|上题|上述|此|这个|结果|继续|其|之|本题|前面|刚才")
+
+
+def _resolve_user_question(state):
+    """若当前问题含指代词且存在上一题，则把上一题题目拼进当前问题，使其自包含。"""
+    user_q, decompose_note = _current_question_and_decompose(state)
+    resolved = user_q or ""
+    if resolved and _REF_WORDS.search(resolved):
+        recent = _recent_context(state["messages"], max_rounds=1)
+        if recent:
+            prev_q = recent[-1][0]
+            resolved = f"[本题承接上一题：{prev_q}]\n当前问题：{resolved}"
+    return resolved, decompose_note
+
+
 def solve_agent(state: MessagesState):
-    rag_ctx = rag_retrieve(state["messages"][-1].content)
+    user_content, decompose_note = _resolve_user_question(state)
+    rag_ctx = rag_retrieve(user_content)
     system_prompt = f"""
 你是高考数学解题专家，请输出一份「完整、规范、精炼」的高考标准答案（类似官方评分标准答案）。
 
 参考知识库信息（仅作知识点参考）：
 {rag_ctx}
-
 硬性规则：
 1. 计算题、求导、解方程、求取值范围等应调用 sympy_math_calc 工具得到准确结果，禁止徒手心算；若调用工具失败，则直接给出你计算出的结果，不要反复重试工具。
 2. 用户需要图像时调用 plot_function 绘图。
@@ -191,24 +248,26 @@ def solve_agent(state: MessagesState):
 最后：【答案】汇总各小问的最终结论，简洁明确。
 参考拆解出的子问题，分小问依次完整作答。
 """
-    messages = [{"role":"system","content":system_prompt}] + state["messages"]
+    # 只把『当前题（含解析后的指代上下文）+ 拆解note』喂给模型，不携带全部历史
+    messages = [{"role": "system", "content": system_prompt}]
+    if decompose_note:
+        messages.append({"role": "system", "content": decompose_note})
+    messages.append({"role": "user", "content": user_content})
     ai_msg = llm_with_tools.invoke(messages)
-    return {"messages":[ai_msg]}
+    return {"messages": [ai_msg]}
 
 def checker_agent(state: MessagesState):
-    # 提取用户题目与解题 Agent 的初步解答（取最后一个无工具调用的 AI 回答）
-    user_q = ""
+    # 使用解析后的完整题目（含承接的上一题），确保复核时不会丢失指代上下文
+    user_content, _ = _resolve_user_question(state)
     last_solve = ""
     for m in state["messages"]:
-        if getattr(m, "type", "") == "human":
-            user_q = m.content
-        elif getattr(m, "type", "") == "ai" and not getattr(m, "tool_calls", None):
+        if getattr(m, "type", "") == "ai" and not getattr(m, "tool_calls", None):
             last_solve = m.content
     check_prompt = f"""
 你是数学阅卷老师。下面是题目和初步解答，请独立重新演算，检查计算错误和逻辑漏洞。
 
 【题目】
-{user_q}
+{user_content}
 
 【初步解答】
 {last_solve}
@@ -379,11 +438,16 @@ def latex_to_plain(s: str) -> str:
 
 tool_node = ToolNode(tools)
 
+# 复核开关：默认开启（保证标准答案质量）；可在 .env 设 ENABLE_CHECKER=off 关闭以提速
+_ENABLE_CHECKER = os.getenv("ENABLE_CHECKER", "on").lower() in ("1", "true", "on", "yes")
+
 def should_continue(state: MessagesState):
     last_msg = state["messages"][-1]
     if last_msg.tool_calls:
         return "tools"
-    return "checker"
+    if _ENABLE_CHECKER:
+        return "checker"
+    return "__end__"
 
 builder = StateGraph(MessagesState)
 builder.add_node("decompose", decompose_problem)
@@ -392,7 +456,9 @@ builder.add_node("tools", tool_node)
 builder.add_node("checker_agent", checker_agent)
 builder.set_entry_point("decompose")
 builder.add_edge("decompose", "solve_agent")
-builder.add_conditional_edges("solve_agent", should_continue, {"tools":"tools", "checker":"checker_agent"})
+builder.add_conditional_edges(
+    "solve_agent", should_continue,
+    {"tools": "tools", "checker": "checker_agent", "__end__": "__end__"})
 builder.add_edge("tools", "solve_agent")
 builder.add_edge("checker_agent", "__end__")
 
