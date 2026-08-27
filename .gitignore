@@ -1,0 +1,43 @@
+# ---------- Python ----------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+
+# ---------- 环境配置（含本机路径，勿上传） ----------
+.env
+.env.bak
+.env.local
+.env.*
+!.env.example
+
+# ---------- 数据库 / 记忆 ----------
+*.db
+*.db-shm
+*.db-wal
+
+# ---------- 备份文件 ----------
+*.bak
+
+# ---------- 运行产物（自动生成） ----------
+output/
+output_research/
+db_chroma/
+
+# ---------- 用户输入数据（可能含教学资料，默认不上传） ----------
+knowledge_docs/
+raw_exam_files/
+batch_input/
+bath_input/
+
+# ---------- IDE / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
