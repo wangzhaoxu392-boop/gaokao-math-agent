@@ -11,6 +11,7 @@ import os
 import io
 import time
 import shutil
+import threading
 from pathlib import Path
 from contextlib import redirect_stdout
 import gradio as gr
@@ -112,19 +113,50 @@ def upload_batch(files):
 
 def run_batch(files):
     if not files:
-        return "请先选择试卷文件。", None
-    buf = io.StringIO()
+        yield "请先选择试卷文件。", None
+        return
+    yield "⏳ 批量做题启动中（每题约需数分钟），下方实时显示进度...\n", None
+    progress = []
+    done = threading.Event()
+    result = {}
+
+    def worker():
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                for fname in files:
+                    progress.append(f"=== 开始处理文件：{fname} ===")
+                    full_text, docx_path = maa.batch_solve_file(
+                        fname, progress_cb=progress.append)
+                    pdf_path = OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")
+                    maa.text_to_pdf(full_text, str(pdf_path))
+                    progress.append(f"=== {fname} 完成，已生成 Word + PDF ===")
+        except Exception as e:
+            progress.append(f"[错误] {e}")
+        finally:
+            result["log"] = buf.getvalue()
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    acc = "⏳ 批量做题进行中，实时进度如下：\n"
+    seen = 0
+    while not done.is_set():
+        while seen < len(progress):
+            acc += progress[seen] + "\n"
+            seen += 1
+        yield acc, None
+        time.sleep(1.5)
+    while seen < len(progress):
+        acc += progress[seen] + "\n"
+        seen += 1
+    log = result.get("log", "")
     outs = []
-    with redirect_stdout(buf):
-        for fname in files:
-            full_text, docx_path = maa.batch_solve_file(fname)
-            pdf_path = OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")
-            maa.text_to_pdf(full_text, str(pdf_path))
-            for p in (docx_path, str(pdf_path)):
-                if Path(p).exists():
-                    outs.append(str(p))
-    log = buf.getvalue()
-    return log, (outs or None)
+    for fname in files:
+        for p in (OUTPUT_FOLDER / (Path(fname).stem + "_result.docx"),
+                  OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")):
+            if Path(p).exists():
+                outs.append(str(p))
+    yield f"✅ 批量做题完成！完整日志：\n{log}", (outs or None)
 
 
 # ==================== 功能4：真题教研 ====================
@@ -139,18 +171,45 @@ def upload_exam(files):
 
 def run_research(files):
     if not files:
-        return "请先选择要教研的真题文件。", None
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        maa.research_workflow(only_files=list(files))
-    log = buf.getvalue()
+        yield "请先选择要教研的真题文件。", None
+        return
+    yield "⏳ 教研启动中（每题约需数分钟，全程可能 1~4 小时），下方会实时显示进度...\n", None
+    progress = []
+    done = threading.Event()
+    result = {}
+
+    def worker():
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                maa.research_workflow(only_files=list(files),
+                                      progress_cb=progress.append)
+        except Exception as e:
+            progress.append(f"[错误] {e}")
+        finally:
+            result["log"] = buf.getvalue()
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    acc = "⏳ 教研进行中，实时进度如下：\n"
+    seen = 0
+    while not done.is_set():
+        while seen < len(progress):
+            acc += progress[seen] + "\n"
+            seen += 1
+        yield acc, None
+        time.sleep(1.5)
+    while seen < len(progress):
+        acc += progress[seen] + "\n"
+        seen += 1
+    log = result.get("log", "")
     outs = [
         str(p) for p in (
             OUT_RESEARCH_FOLDER / "高考数学教研汇总.docx",
             OUT_RESEARCH_FOLDER / "高考数学教研汇总.pdf",
         ) if p.exists()
     ]
-    return log, (outs or None)
+    yield f"✅ 教研完成！完整日志：\n{log}", (outs or None)
 
 
 # ==================== 网页界面 ====================

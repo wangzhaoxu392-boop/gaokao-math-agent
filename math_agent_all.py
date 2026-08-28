@@ -38,14 +38,18 @@ for p in [CHROMA_DB_PATH, KNOWLEDGE_FOLDER, BATCH_INPUT_FOLDER, OUTPUT_FOLDER, R
 llm = ChatOllama(
     base_url=os.getenv("OLLAMA_BASE_URL"),
     model=os.getenv("LLM_MODEL"),
-    temperature=0.2
+    temperature=0.2,
+    num_predict=3072,   # 单次输出上限，防止 deepseek-r1 无限思考/超长输出
+    timeout=900         # 15 分钟超时兜底，防止单次推理永久卡死
 )
 
 # 快速模型：用于拆题等轻量环节，加快功能1速度（可用 .env 的 FAST_MODEL 覆盖）
 llm_fast = ChatOllama(
     base_url=os.getenv("OLLAMA_BASE_URL"),
     model=os.getenv("FAST_MODEL", "qwen2.5:7b"),
-    temperature=0.1
+    temperature=0.1,
+    num_predict=1024,
+    timeout=300
 )
 
 CATEGORY_LIST = ["集合", "函数", "导数", "三角", "数列", "立体几何", "圆锥曲线", "概率统计"]
@@ -489,7 +493,14 @@ def read_batch_file(filepath:Path):
     else:
         raise Exception(f"不支持文件后缀 {suffix}")
 
-def batch_solve_file(filename: str):
+def batch_solve_file(filename: str, progress_cb=None):
+    def _report(msg):
+        if progress_cb is not None:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+        print(msg)
     file_path = Path(BATCH_INPUT_FOLDER)/filename
     content = read_batch_file(file_path)
     # 按“行首编号”切分多道习题：支持 1. / 1、/ 1． 三种编号；
@@ -502,7 +513,9 @@ def batch_solve_file(filename: str):
     config = {"configurable":{"thread_id":thread_id}, "recursion_limit": 10}
     graph_chat.update_state(config, {"messages":[]})
 
+    _report(f"【{filename}】共识别 {len(q_list)} 道题")
     for idx, q in enumerate(q_list):
+        _report(f"【{filename}】正在解答第 {idx+1}/{len(q_list)} 题：{q[:30]}...")
         print(f"\n====批量处理第{idx+1}题====\n题目：{q[:80]}")
         ans_text = run_question(graph_chat, q, config)
         all_out_items.append({
@@ -647,38 +660,46 @@ def _safe_json_loads(s: str):
         return None
 
 
-def research_workflow(only_files=None):
-    print(f"\n====教研模块，读取文件夹 {RAW_EXAM_FOLDER}====")
+def research_workflow(only_files=None, progress_cb=None):
+    def _report(msg):
+        if progress_cb is not None:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+        print(msg)
+    _report(f"====教研模块，读取文件夹 {RAW_EXAM_FOLDER}====")
     file_list = load_raw_exam_files()
     if only_files:
         only_set = set(only_files)
         file_list = [x for x in file_list if x[0] in only_set]
     if len(file_list)==0:
-        print("请把PDF/docx真题放入raw_exam_files")
+        _report("请把PDF/docx真题放入raw_exam_files")
         return
-    print(f"读取到 {len(file_list)} 份试卷")
+    _report(f"读取到 {len(file_list)} 份试卷")
     all_research_items = []
     for fname,full_text in file_list:
-        print(f"\n处理文件：{fname}")
+        _report(f"\n【{fname}】开始处理")
         chunks = re.split(r"\n{3,}",full_text)
-        for ck in chunks:
-            ck = ck.strip()
-            if len(ck)<80:
-                continue
+        valid_chunks = [c.strip() for c in chunks if len(c.strip())>=80]
+        _report(f"【{fname}】共 {len(valid_chunks)} 个有效片段")
+        for ci, ck in enumerate(valid_chunks):
+            _report(f"【{fname}】正在分析第 {ci+1}/{len(valid_chunks)} 段...")
             resp_ext = llm.invoke([{"role":"user","content":EXTRACT_PROMPT.format(text_chunk=ck)}])
             raw = resp_ext.content
             json_match = re.search(r"\[.*\]", raw, re.DOTALL)
             if not json_match:
+                _report(f"【{fname}】第 {ci+1}/{len(valid_chunks)} 段未提取到题目，跳过")
                 continue
             try:
                 q_arr = _safe_json_loads(json_match.group())
                 if q_arr is None:
-                    print(f"片段解析失败，跳过（JSON无法修复）")
+                    _report(f"【{fname}】第 {ci+1}/{len(valid_chunks)} 段解析失败（JSON无法修复），跳过")
                     continue
                 for item in q_arr:
                     q = item.get("question","")
                     cat = item.get("category","未知分类")
-                    print(f" >>教研题目 {q[:50]}... 分类:{cat}")
+                    _report(f"  >>教研题目 {q[:40]}... 分类:{cat}")
                     ana_resp = llm.invoke([{"role":"user","content":RESEARCH_PROMPT.format(q_text=q)}])
                     all_research_items.append({
                         "category":cat,
@@ -686,7 +707,9 @@ def research_workflow(only_files=None):
                         "research_content":clean_model_answer(ana_resp.content)
                     })
             except Exception as e:
-                print(f"片段解析跳过 {e}")
+                _report(f"【{fname}】片段解析跳过 {e}")
+            _report(f"【{fname}】第 {ci+1}/{len(valid_chunks)} 段完成")
+        _report(f"【{fname}】处理完成")
     #导出word
     doc = Document()
     doc.add_heading("高考数学真题教研资料", level=1)
