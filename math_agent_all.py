@@ -552,13 +552,32 @@ def text_to_pdf(text:str, pdf_save_path:str):
     print(f"✅PDF输出：{pdf_save_path}")
 
 # ========================教研模块：PDF/Word真题自动教研========================
+# MathType/Symbol 字体的私有区乱码符号 → 正确 Unicode 数学符号
+_SYMBOL_MAP = {
+    '\uf028':'(', '\uf029':')', '\uf02b':'+', '\uf02d':'-', '\uf03c':'<', '\uf03d':'=', '\uf03e':'>',
+    '\uf05e':'\u22a5',  # ⊥
+    '\uf061':'\u03b1', '\uf062':'\u03b2', '\uf070':'\u03c0', '\uf073':'\u03c3',
+    '\uf07b':'{', '\uf07c':'|', '\uf07d':'}',
+    '\uf0a2':'\u2032', '\uf0a3':'\u2264', '\uf0a5':'\u221e', '\uf0b3':'\u2265', '\uf0bb':'\u2248',
+    '\uf0e6':'(', '\uf0e7':'(', '\uf0e8':')',
+    '\uf0ec':'{', '\uf0ed':'{', '\uf0ee':'}',
+    '\uf0f6':')', '\uf0f7':')', '\uf0f8':')',
+    '\uf049':'\u2229',  # ∩
+    '\uf072':'\u2192',  # →
+    '\uf056':'\u25b3',  # △
+}
+
+def clean_math_symbols(text: str) -> str:
+    """把 MathType 公式转成的私有区乱码还原为正常数学符号。"""
+    return ''.join(_SYMBOL_MAP.get(ch, ch) for ch in text)
+
 def read_pdf(filepath: Path) -> str:
     text_all = ""
     with pdfplumber.open(filepath) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
-                text_all += page_text + "\n"
+                text_all += clean_math_symbols(page_text) + "\n"
     return text_all
 
 def read_docx(filepath: Path) -> str:
@@ -606,9 +625,34 @@ RESEARCH_PROMPT = """
 7.【一题三变】给出3道变式题，改变条件，同源考点，用于训练。
 """
 
-def research_workflow():
+def _safe_json_loads(s: str):
+    """宽容解析 AI 输出的 JSON 数组：自动清理非法控制字符，避免整段题目被丢弃。"""
+    # 尝试直接解析
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    # 非法控制字符（JSON 任何位置都不允许 0x00-0x08/0x0b/0x0c/0x0e-0x1f/0x7f）直接移除
+    s2 = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', s)
+    try:
+        return json.loads(s2)
+    except json.JSONDecodeError:
+        pass
+    # 字符串内部未转义的换行/制表符替换为空格（牺牲字符串内换行，换取整段可解析）
+    s3 = s2.replace('\t', ' ').replace('\r', ' ')
+    s3 = re.sub(r'(?<=[^"\\])\n(?=[^"])', ' ', s3)
+    try:
+        return json.loads(s3)
+    except json.JSONDecodeError:
+        return None
+
+
+def research_workflow(only_files=None):
     print(f"\n====教研模块，读取文件夹 {RAW_EXAM_FOLDER}====")
     file_list = load_raw_exam_files()
+    if only_files:
+        only_set = set(only_files)
+        file_list = [x for x in file_list if x[0] in only_set]
     if len(file_list)==0:
         print("请把PDF/docx真题放入raw_exam_files")
         return
@@ -627,7 +671,10 @@ def research_workflow():
             if not json_match:
                 continue
             try:
-                q_arr = json.loads(json_match.group())
+                q_arr = _safe_json_loads(json_match.group())
+                if q_arr is None:
+                    print(f"片段解析失败，跳过（JSON无法修复）")
+                    continue
                 for item in q_arr:
                     q = item.get("question","")
                     cat = item.get("category","未知分类")

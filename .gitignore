@@ -41,3 +41,6 @@ bath_input/
 .DS_Store
 Thumbs.db
 *.log
+
+# exam backup (large files, not uploaded)
+raw_exam_files_backup/

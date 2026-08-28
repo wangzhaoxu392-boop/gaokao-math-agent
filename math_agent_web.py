@@ -110,16 +110,20 @@ def upload_batch(files):
     return msg, gr.update(choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
 
 
-def run_batch(filename):
-    if not filename:
-        return "请先选择或上传试卷文件。", None
+def run_batch(files):
+    if not files:
+        return "请先选择试卷文件。", None
     buf = io.StringIO()
+    outs = []
     with redirect_stdout(buf):
-        full_text, docx_path = maa.batch_solve_file(filename)
-        pdf_path = OUTPUT_FOLDER / (Path(filename).stem + "_result.pdf")
-        maa.text_to_pdf(full_text, str(pdf_path))
+        for fname in files:
+            full_text, docx_path = maa.batch_solve_file(fname)
+            pdf_path = OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")
+            maa.text_to_pdf(full_text, str(pdf_path))
+            for p in (docx_path, str(pdf_path)):
+                if Path(p).exists():
+                    outs.append(str(p))
     log = buf.getvalue()
-    outs = [p for p in (docx_path, str(pdf_path)) if Path(p).exists()]
     return log, (outs or None)
 
 
@@ -133,10 +137,12 @@ def upload_exam(files):
     return msg, gr.update(choices=_list_files(RAW_EXAM_FOLDER, (".pdf", ".docx")))
 
 
-def run_research():
+def run_research(files):
+    if not files:
+        return "请先选择要教研的真题文件。", None
     buf = io.StringIO()
     with redirect_stdout(buf):
-        maa.research_workflow()
+        maa.research_workflow(only_files=list(files))
     log = buf.getvalue()
     outs = [
         str(p) for p in (
@@ -187,7 +193,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
     # ---------- 功能3 ----------
     with gr.Tab("③ 批量做题"):
         batch_file = gr.Dropdown(
-            label="选择 batch_input 中的试卷",
+            label="选择 batch_input 中的试卷（可多选，一次处理多份）",
+            multiselect=True,
             choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
         with gr.Row():
             btn_refresh_b = gr.Button("刷新列表")
@@ -196,7 +203,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
             label="上传试卷到 batch_input（txt/md/docx/pdf）", file_count="multiple")
         batch_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
         batch_log = gr.Textbox(label="处理日志", lines=12, interactive=False)
-        batch_dl = gr.File(label="下载解答文档（Word + PDF）")
+        batch_dl = gr.File(label="下载解答文档（Word + PDF，可多份）")
         batch_upload.upload(upload_batch, inputs=[batch_upload],
                             outputs=[batch_msg, batch_file])
         btn_refresh_b.click(refresh_batch, outputs=[batch_file])
@@ -206,7 +213,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
     # ---------- 功能4 ----------
     with gr.Tab("④ 真题教研"):
         exam_file = gr.Dropdown(
-            label="raw_exam_files 中的真题（可选，教研会自动处理全部文件）",
+            label="选择 raw_exam_files 中的真题（可多选，只教研选中的文件）",
+            multiselect=True,
             choices=_list_files(RAW_EXAM_FOLDER, (".pdf", ".docx")))
         with gr.Row():
             btn_refresh_e = gr.Button("刷新列表")
@@ -219,9 +227,11 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         exam_upload.upload(upload_exam, inputs=[exam_upload],
                            outputs=[exam_msg, exam_file])
         btn_refresh_e.click(refresh_exam, outputs=[exam_file])
-        btn_research.click(run_research, outputs=[exam_log, exam_dl])
+        btn_research.click(run_research, inputs=[exam_file],
+                           outputs=[exam_log, exam_dl])
 
 if __name__ == "__main__":
     # 并发设为 1，避免与本地 Ollama 单实例推理冲突
+    # inbrowser=False：避免和启动脚本自动打开浏览器冲突（否则会开两个网页）
     demo.queue(default_concurrency_limit=1).launch(
-        server_name="127.0.0.1", server_port=7860, inbrowser=True)
+        server_name="127.0.0.1", server_port=7860, inbrowser=False)
