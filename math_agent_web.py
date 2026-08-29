@@ -87,8 +87,9 @@ def solve_one(question):
     yield f"（本题用时 {dt:.0f} 秒）\n\n{ans}", img
 
 
-# ==================== 功能2：RAG 知识库 ====================
+# ==================== 功能2：LLM Wiki 知识库（Karpathy 改造） ====================
 def build_kb():
+    """（备选）旧版 RAG 向量库构建，未编译 Wiki 时作为回退"""
     files = _list_files(KNOWLEDGE_FOLDER)
     info = f"📁 knowledge_docs 现有文件：{files if files else '（空）'}\n\n"
     log, _ = _run_with_console(maa.build_rag_vector_db)
@@ -97,8 +98,80 @@ def build_kb():
 
 def upload_kb(files):
     msg = _save_uploads(files, KNOWLEDGE_FOLDER)
-    return msg + "\n上传后请点击【构建/更新知识库】使其生效。", gr.update(
-        choices=_list_files(KNOWLEDGE_FOLDER))
+    return msg + "\n上传后请点击【编译 Wiki 知识库】使其生效。", (
+        "、".join(_list_files(KNOWLEDGE_FOLDER)) or "（空）")
+
+
+def _wiki_status():
+    try:
+        return maa.wiki_summary()
+    except Exception:
+        return "Wiki 概况读取失败"
+
+
+def run_build_wiki():
+    yield "⏳ Wiki 编译启动中（按资料量数分钟到数十分钟），实时进度如下：\n", None
+    progress = []
+    done = threading.Event()
+    result = {}
+
+    def worker():
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                maa.build_wiki(progress_cb=progress.append)
+        except Exception as e:
+            progress.append(f"[错误] {e}")
+        finally:
+            result["log"] = buf.getvalue()
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    acc = "⏳ Wiki 编译中，实时进度如下：\n"
+    seen = 0
+    while not done.is_set():
+        while seen < len(progress):
+            acc += progress[seen] + "\n"
+            seen += 1
+        yield acc, None
+        time.sleep(1.5)
+    while seen < len(progress):
+        acc += progress[seen] + "\n"
+        seen += 1
+    log = result.get("log", "")
+    yield f"✅ Wiki 编译结束！完整日志：\n{log}", _wiki_status()
+
+
+def run_wiki_lint():
+    yield "⏳ Wiki 自检中...\n", None
+    progress = []
+    done = threading.Event()
+    result = {}
+
+    def worker():
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                maa.wiki_lint(progress_cb=progress.append)
+        except Exception as e:
+            progress.append(f"[错误] {e}")
+        finally:
+            result["log"] = buf.getvalue()
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    acc = "⏳ 自检中...\n"
+    seen = 0
+    while not done.is_set():
+        while seen < len(progress):
+            acc += progress[seen] + "\n"
+            seen += 1
+        yield acc, None
+        time.sleep(1.0)
+    while seen < len(progress):
+        acc += progress[seen] + "\n"
+        seen += 1
+    yield result.get("log", "自检完成")
 
 
 # ==================== 功能3：批量做题 ====================
@@ -235,19 +308,31 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         btn_clear.click(clear_memory, outputs=[out_text])
 
     # ---------- 功能2 ----------
-    with gr.Tab("② RAG 知识库"):
+    with gr.Tab("② LLM Wiki 知识库"):
+        gr.Markdown("""
+**Karpathy LLM Wiki 模式**：`knowledge_docs/` 是原始资料层（只进不改）。
+点击「编译 Wiki 知识库」后，LLM 会把资料**编译成结构化的 Markdown 词条**（分类 / 要点 / 交叉链接 / 总索引），
+解题时直接从编译好的 Wiki 检索（更快、知识可积累）；未编译时自动回退旧 RAG。
+""")
         kb_files = gr.Textbox(
-            label="knowledge_docs 当前文件",
+            label="knowledge_docs 当前文件（原始资料层）",
             value="、".join(_list_files(KNOWLEDGE_FOLDER)) or "（空）",
             interactive=False)
         kb_upload = gr.File(label="上传资料到 knowledge_docs（txt/md/docx/pdf）",
                             file_count="multiple")
         kb_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
-        btn_build = gr.Button("构建/更新知识库", variant="primary")
-        kb_log = gr.Textbox(label="构建日志", lines=12, interactive=False)
+        with gr.Row():
+            btn_wiki_build = gr.Button("编译 Wiki 知识库", variant="primary")
+            btn_wiki_lint = gr.Button("Wiki 自检")
+        wiki_status = gr.Textbox(
+            label="Wiki 概况", value=_wiki_status(), interactive=False, lines=2)
+        kb_log = gr.Textbox(label="Wiki 日志", lines=12, interactive=False)
+        btn_build_legacy = gr.Button("重建旧版 RAG 向量库（备选，未编译 Wiki 时回退用）")
         kb_upload.upload(upload_kb, inputs=[kb_upload],
                          outputs=[kb_msg, kb_files])
-        btn_build.click(build_kb, outputs=[kb_log])
+        btn_wiki_build.click(run_build_wiki, outputs=[kb_log, wiki_status])
+        btn_wiki_lint.click(run_wiki_lint, outputs=[kb_log])
+        btn_build_legacy.click(build_kb, outputs=[kb_log])
 
     # ---------- 功能3 ----------
     with gr.Tab("③ 批量做题"):

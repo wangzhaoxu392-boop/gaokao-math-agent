@@ -31,8 +31,11 @@ BATCH_INPUT_FOLDER = "./batch_input"
 OUTPUT_FOLDER = "./output"
 RAW_EXAM_FOLDER = "./raw_exam_files"
 OUT_RESEARCH_FOLDER = "./output_research"
+# Karpathy LLM Wiki：编译产物与检索库（功能2 新架构）
+WIKI_FOLDER = "./wiki"
+WIKI_DB_PATH = "./db_wiki"
 
-for p in [CHROMA_DB_PATH, KNOWLEDGE_FOLDER, BATCH_INPUT_FOLDER, OUTPUT_FOLDER, RAW_EXAM_FOLDER, OUT_RESEARCH_FOLDER]:
+for p in [CHROMA_DB_PATH, KNOWLEDGE_FOLDER, BATCH_INPUT_FOLDER, OUTPUT_FOLDER, RAW_EXAM_FOLDER, OUT_RESEARCH_FOLDER, WIKI_FOLDER, WIKI_DB_PATH]:
     os.makedirs(p, exist_ok=True)
 
 llm = ChatOllama(
@@ -136,7 +139,11 @@ def load_rag_db():
     return None
 
 def rag_retrieve(query: str):
-    # 若 knowledge_docs 无任何可检索文档，直接跳过向量库检索，
+    # 【Karpathy 改造】优先从编译好的 LLM Wiki 检索结构化词条；未编译/失败则回退旧 RAG
+    wiki_ctx = wiki_retrieve(query)
+    if wiki_ctx:
+        return wiki_ctx
+    # 旧 RAG 回退：若 knowledge_docs 无任何可检索文档，直接跳过向量库检索，
     # 避免每次解题都加载嵌入模型（nomic-embed-text）拖慢速度。
     doc_files = [
         f for f in Path(KNOWLEDGE_FOLDER).glob("*")
@@ -152,6 +159,323 @@ def rag_retrieve(query: str):
     for d in docs:
         context += d.page_content + "\n"
     return context
+
+# ========================B2 Karpathy LLM Wiki 模块（功能2 新架构）========================
+# 思想：不再每次从原始文档临时检索（RAG），而是让 LLM 把 knowledge_docs 资料
+# “编译”成结构化的 Markdown Wiki（词条+交叉链接+总索引），提问时直接读 Wiki。
+# 层次：knowledge_docs/（原始资料层）→ wiki/（编译词条层）→ 编译规范（内置 prompt）。
+WIKI_COMPILE_PROMPT = """
+你是高中数学教研专家。下面是一份讲义/知识点资料片段，请把它“编译”成 Wiki 词条。
+规则：
+1. 提炼出资料中真正的核心概念/知识点作为词条标题，标题简短有力（如“导数与单调性”“等比数列求和”“离心率”）。不要用一句话原文当标题。
+2. 每个词条字段：
+   - title：词条标题
+   - category：分类，只能从【集合、函数、导数、三角、数列、立体几何、圆锥曲线、概率统计、其他】选一个
+   - summary：一句话概述该知识点
+   - key_points：要点数组，逐条列出关键结论/公式/方法
+   - related：相关联的其它词条标题数组（用于交叉链接）
+3. 只输出 JSON 数组，不要任何多余解释或 Markdown 代码块标记。
+资料片段：
+{chunk}
+"""
+
+def _split_knowledge_text(text: str, size: int = 600):
+    """先按空行切段，再合并成约 size 字符的块，保证每块上下文完整"""
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks, cur = [], ""
+    for p in parts:
+        if cur and len(cur) + len(p) > size:
+            chunks.append(cur)
+            cur = p
+        else:
+            cur = (cur + "\n" + p).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks or ([text.strip()] if text.strip() else [])
+
+
+def _safe_wiki_name(title: str) -> str:
+    """词条标题转合法文件名"""
+    t = re.sub(r'[\\/:*?"<>|\r\n]', "", title).strip()
+    return t[:40] or "未命名"
+
+
+def build_wiki(progress_cb=None):
+    """Karpathy 编译：knowledge_docs → wiki/ 结构化词条 + 索引 + 向量检索库"""
+    def _report(m):
+        if progress_cb is not None:
+            try:
+                progress_cb(m)
+            except Exception:
+                pass
+        print(m)
+    _report(f"====LLM Wiki 编译开始：读取 {KNOWLEDGE_FOLDER}====")
+    support = (".txt", ".md", ".docx", ".pdf")
+    files = [f for f in Path(KNOWLEDGE_FOLDER).glob("*")
+             if f.is_file() and f.suffix.lower() in support]
+    if not files:
+        _report("knowledge_docs 无有效文档，请先上传资料")
+        return None
+    all_items = []
+    for fp in files:
+        _report(f"读取 {fp.name} ...")
+        content = read_knowledge_file(fp)
+        if not content.strip():
+            continue
+        chunks = _split_knowledge_text(content)
+        _report(f"  {fp.name} 共 {len(chunks)} 块，逐块编译中")
+        for ci, ck in enumerate(chunks):
+            _report(f"  ▶ 第 {ci+1}/{len(chunks)} 块提炼词条...")
+            try:
+                resp = llm_fast.invoke(
+                    [{"role": "user", "content": WIKI_COMPILE_PROMPT.format(chunk=ck)}])
+                m = re.search(r"\[.*\]", resp.content, re.DOTALL)
+                if not m:
+                    _report("    未提取到 JSON 词条，跳过")
+                    continue
+                arr = _safe_json_loads(m.group())
+                if not arr:
+                    _report("    JSON 解析失败，跳过")
+                    continue
+                for it in arr:
+                    title = str(it.get("title", "")).strip()
+                    if not title:
+                        continue
+                    cat = str(it.get("category", "其他")).strip()
+                    if cat not in CATEGORY_LIST:
+                        cat = "其他"
+                    all_items.append({
+                        "title": title,
+                        "category": cat,
+                        "summary": str(it.get("summary", "")).strip(),
+                        "key_points": [str(k).strip() for k in it.get("key_points", []) if str(k).strip()],
+                        "related": [str(r).strip() for r in it.get("related", []) if str(r).strip()],
+                        "source": fp.name,
+                    })
+            except Exception as e:
+                _report(f"    第 {ci+1} 块编译失败：{e}")
+    if not all_items:
+        _report("未编译出任何词条，请检查资料内容或稍后重试")
+        return None
+    # —— 写出词条文件（按分类组织）——
+    wiki_root = Path(WIKI_FOLDER)
+    for sub in wiki_root.iterdir():  # 清空旧编译产物
+        if sub.is_dir():
+            for f in sub.rglob("*"):
+                if f.is_file():
+                    f.unlink()
+            sub.rmdir()
+        elif sub.is_file():
+            sub.unlink()
+    for cat in CATEGORY_LIST + ["其他"]:
+        (wiki_root / cat).mkdir(parents=True, exist_ok=True)
+    for it in all_items:
+        fn = wiki_root / it["category"] / (_safe_wiki_name(it["title"]) + ".md")
+        lines = [f"# {it['title']}", "",
+                 f"> 分类：{it['category']} ｜ 来源：{it['source']}", ""]
+        if it["summary"]:
+            lines += ["## 概述", "", it["summary"], ""]
+        if it["key_points"]:
+            lines += ["## 要点", ""]
+            lines += [f"- {k}" for k in it["key_points"]]
+            lines.append("")
+        if it["related"]:
+            lines += ["## 关联词条", ""]
+            lines += [f"- [[{r}]]" for r in it["related"]]
+            lines.append("")
+        fn.write_text("\n".join(lines), encoding="utf-8")
+    # —— 总索引 ——
+    index_lines = ["# 📚 LLM Wiki 总索引（由知识库自动编译）", ""]
+    index_lines.append(f"> 编译时间：{time.strftime('%Y-%m-%d %H:%M:%S')} ｜ 词条数：{len(all_items)} ｜ 来源文件：{len(files)} 个")
+    index_lines.append("")
+    for cat in CATEGORY_LIST + ["其他"]:
+        items = [it for it in all_items if it["category"] == cat]
+        if not items:
+            continue
+        index_lines.append(f"## {cat}")
+        for it in items:
+            index_lines.append(f"- [{it['title']}]({cat}/{_safe_wiki_name(it['title'])}.md)")
+        index_lines.append("")
+    (wiki_root / "index.md").write_text("\n".join(index_lines), encoding="utf-8")
+    (wiki_root / "_meta.json").write_text(json.dumps({
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "count": len(all_items),
+        "sources": [f.name for f in files],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    # —— 建立向量检索库（查询用）——
+    _index_wiki_db()
+    _report(f"✅ LLM Wiki 编译完成：共 {len(all_items)} 个词条，索引与检索库已更新")
+    return all_items
+
+
+def _index_wiki_db():
+    """把 wiki 词条页内容建入 Chroma，供查询检索"""
+    wiki_root = Path(WIKI_FOLDER)
+    pages = sorted(p for p in wiki_root.rglob("*.md") if p.name != "index.md")
+    texts, metas = [], []
+    for p in pages:
+        texts.append(p.read_text(encoding="utf-8"))
+        metas.append(str(p))
+    if not texts:
+        return None
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    db = Chroma.from_texts(texts, embedding=embeddings,
+                           metadatas=[{"page": m} for m in metas],
+                           persist_directory=WIKI_DB_PATH)
+    return db
+
+
+def _query_tokens(query: str):
+    """把查询拆成可匹配的词元：英文/数字词 + 中文 2~3 字滑动窗口"""
+    toks = set()
+    for w in re.findall(r"[a-zA-Z0-9]+", query):
+        if len(w) >= 2:
+            toks.add(w.lower())
+    cn = re.sub(r"[^\u4e00-\u9fa5]", "", query)
+    for n in (3, 2):
+        for i in range(len(cn) - n + 1):
+            toks.add(cn[i:i + n])
+    return toks
+
+
+def wiki_retrieve(query: str, k: int = 3):
+    """Karpathy 查询：直接从编译好的 wiki 词条检索。
+    关键词打分（标题权重高）优先 + 向量检索补充，符合“直接读 Wiki”思想。
+    未编译/失败返回 None（由调用方回退 RAG）。"""
+    meta_path = Path(WIKI_FOLDER) / "_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        pages = [p for p in Path(WIKI_FOLDER).rglob("*.md") if p.name != "index.md"]
+        page_data = []
+        for p in pages:
+            text = p.read_text(encoding="utf-8")
+            page_data.append({"title": p.stem, "text": text, "page": str(p)})
+        if not page_data:
+            return None
+        # 1) 关键词打分：命中标题权重 3，命中正文权重 1（n-gram 拆分中文查询）
+        keywords = _query_tokens(query)
+        scored = []
+        for pd in page_data:
+            score = 0
+            for w in keywords:
+                if w in pd["title"]:
+                    score += 3
+                if w in pd["text"]:
+                    score += 1
+            scored.append((score, pd))
+        scored.sort(key=lambda x: -x[0])
+        top = [pd for s, pd in scored if s > 0][:k]
+        # 2) 关键词命中不足时，用向量检索补充
+        if len(top) < k:
+            try:
+                embeddings = OllamaEmbeddings(model="nomic-embed-text")
+                if os.path.exists(WIKI_DB_PATH) and len(os.listdir(WIKI_DB_PATH)) > 0:
+                    db = Chroma(persist_directory=WIKI_DB_PATH, embedding_function=embeddings)
+                else:
+                    db = _index_wiki_db()
+                if db is not None:
+                    for d in db.similarity_search(query, k=k):
+                        if len(top) >= k:
+                            break
+                        pg = d.metadata.get("page", "")
+                        if pg and not any(pd["page"] == pg for pd in top):
+                            top.append({"title": Path(pg).stem,
+                                        "text": d.page_content, "page": pg})
+            except Exception as e:
+                print(f"wiki向量补充检索失败：{e}")
+        if not top:
+            return None
+        context = "\n====[LLM Wiki 知识词条]====\n"
+        for pd in top[:k]:
+            context += f"\n--- 词条：{pd['title']} ---\n{pd['text']}\n"
+        return context
+    except Exception as e:
+        print(f"wiki检索失败，回退RAG：{e}")
+        return None
+
+
+def wiki_lint(progress_cb=None):
+    """Karpathy 自检：检查交叉链接/索引完整性，必要时重建索引"""
+    def _report(m):
+        if progress_cb is not None:
+            try:
+                progress_cb(m)
+            except Exception:
+                pass
+        print(m)
+    wiki_root = Path(WIKI_FOLDER)
+    if not (wiki_root / "_meta.json").exists():
+        _report("尚未编译 Wiki，请先点击「编译 Wiki 知识库」")
+        return None
+    pages = [p for p in wiki_root.rglob("*.md") if p.name != "index.md"]
+    index_path = wiki_root / "index.md"
+    titles = {p.stem for p in pages}
+    issues = []
+    link_re = re.compile(r"\[\[([^\]|]+)\]\]")
+    # 1) 交叉链接目标
+    for p in pages:
+        for t in link_re.findall(p.read_text(encoding="utf-8")):
+            if t.strip() not in titles:
+                issues.append(f"断裂链接：{p.stem} → [[{t}]]")
+    # 2) 索引指向
+    if index_path.exists():
+        for line in index_path.read_text(encoding="utf-8").splitlines():
+            m = re.search(r"\]\(([^)]+\.md)\)", line)
+            if m and not (wiki_root / m.group(1)).exists():
+                issues.append(f"索引失效：{m.group(1)}")
+    # 3) 孤儿词条（无入链）
+    incoming = {t: 0 for t in titles}
+    for p in pages:
+        for t in link_re.findall(p.read_text(encoding="utf-8")):
+            if t.strip() in incoming:
+                incoming[t.strip()] += 1
+    orphans = [t for t, c in incoming.items() if c == 0]
+    _report(f"词条数：{len(titles)}，交叉链接检查完毕")
+    if issues:
+        for i in issues:
+            _report(f"⚠ {i}")
+    else:
+        _report("✅ 链接完整，无断裂")
+    if orphans:
+        _report(f"ℹ 孤儿词条（暂无入链）：{'、'.join(orphans)}")
+    if not index_path.exists():
+        _rebuild_wiki_index(wiki_root)
+        _report("✅ 缺失的 index.md 已重建")
+    return issues
+
+
+def _rebuild_wiki_index(wiki_root: Path):
+    """按现有词条文件重建总索引"""
+    cats = {}
+    for p in sorted(wiki_root.rglob("*.md")):
+        if p.name == "index.md":
+            continue
+        cats.setdefault(p.parent.name, []).append(p.stem)
+    lines = ["# 📚 LLM Wiki 总索引", ""]
+    for cat in CATEGORY_LIST + ["其他"]:
+        items = cats.get(cat, [])
+        if not items:
+            continue
+        lines.append(f"## {cat}")
+        for t in items:
+            lines.append(f"- [{t}]({cat}/{_safe_wiki_name(t)}.md)")
+        lines.append("")
+    (wiki_root / "index.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def wiki_summary() -> str:
+    """返回 wiki 编译概况（供网页端展示）"""
+    meta_path = Path(WIKI_FOLDER) / "_meta.json"
+    if not meta_path.exists():
+        return "尚未编译 Wiki（点击「编译 Wiki 知识库」生成）"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        return (f"✅ 已编译 {meta.get('count', 0)} 个词条，"
+                f"来源 {len(meta.get('sources', []))} 个文件，"
+                f"编译时间 {meta.get('built_at', '')}")
+    except Exception:
+        return "Wiki 元信息读取失败"
 
 # ========================D 大题自动拆解节点========================
 def _looks_like_big_problem(user_q: str) -> bool:
@@ -764,7 +1088,7 @@ def print_main_menu():
     print("""
 ==================== 高考数学一体化Agent 主菜单 ====================
 1 ｜单题交互模式（记忆+RAG+大题拆解+绘图+校验复核）
-2 ｜构建/更新RAG知识库【支持 txt/md/docx/pdf】
+2 ｜编译/更新 LLM Wiki 知识库（Karpathy式，支持 txt/md/docx/pdf）
 3 ｜批量做题（batch_input支持 txt / md / docx / pdf，输出docx+pdf）
 4 ｜真题教研模块：批量读取raw_exam_files中PDF/Word，输出教研Word+PDF
 q ｜退出程序
@@ -797,7 +1121,7 @@ if __name__ == "__main__":
                 print(ans_text)
                 print("‑"*80)
         elif opt=="2":
-            build_rag_vector_db()
+            build_wiki()
         elif opt=="3":
             exts = (".txt",".md",".docx",".pdf")
             files = [f for f in os.listdir(BATCH_INPUT_FOLDER) if Path(f).suffix.lower() in exts]
