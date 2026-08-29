@@ -51,7 +51,7 @@ llm_fast = ChatOllama(
     base_url=os.getenv("OLLAMA_BASE_URL"),
     model=os.getenv("FAST_MODEL", "qwen2.5:7b"),
     temperature=0.1,
-    num_predict=1024,
+    num_predict=2048,
     timeout=300
 )
 
@@ -179,11 +179,19 @@ WIKI_COMPILE_PROMPT = """
 {chunk}
 """
 
-def _split_knowledge_text(text: str, size: int = 600):
-    """先按空行切段，再合并成约 size 字符的块，保证每块上下文完整"""
+def _split_knowledge_text(text: str, size: int = 800):
+    """先按空行切段，再合并成约 size 字符的块；单段过长则硬切，保证每块不超过 size，
+    避免整份大文件挤成一块导致模型 JSON 输出过长被截断而解析失败。"""
     parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     chunks, cur = [], ""
     for p in parts:
+        # 单段超过 size：先清空当前缓冲，再硬切成长段
+        while len(p) > size:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(p[:size])
+            p = p[size:]
         if cur and len(cur) + len(p) > size:
             chunks.append(cur)
             cur = p
@@ -226,34 +234,38 @@ def build_wiki(progress_cb=None):
         _report(f"  {fp.name} 共 {len(chunks)} 块，逐块编译中")
         for ci, ck in enumerate(chunks):
             _report(f"  ▶ 第 {ci+1}/{len(chunks)} 块提炼词条...")
-            try:
-                resp = llm_fast.invoke(
-                    [{"role": "user", "content": WIKI_COMPILE_PROMPT.format(chunk=ck)}])
-                m = re.search(r"\[.*\]", resp.content, re.DOTALL)
-                if not m:
-                    _report("    未提取到 JSON 词条，跳过")
+            arr = None
+            for attempt in range(2):  # 解析失败自动重试一次
+                try:
+                    resp = llm_fast.invoke(
+                        [{"role": "user", "content": WIKI_COMPILE_PROMPT.format(chunk=ck)}])
+                    m = re.search(r"\[.*\]", resp.content, re.DOTALL)
+                    if m:
+                        arr = _safe_json_loads(m.group())
+                except Exception:
+                    arr = None
+                if arr:
+                    break
+                if attempt == 0:
+                    _report("    JSON 解析失败，重试一次...")
+            if not arr:
+                _report("    仍解析失败，跳过该块")
+                continue
+            for it in arr:
+                title = str(it.get("title", "")).strip()
+                if not title:
                     continue
-                arr = _safe_json_loads(m.group())
-                if not arr:
-                    _report("    JSON 解析失败，跳过")
-                    continue
-                for it in arr:
-                    title = str(it.get("title", "")).strip()
-                    if not title:
-                        continue
-                    cat = str(it.get("category", "其他")).strip()
-                    if cat not in CATEGORY_LIST:
-                        cat = "其他"
-                    all_items.append({
-                        "title": title,
-                        "category": cat,
-                        "summary": str(it.get("summary", "")).strip(),
-                        "key_points": [str(k).strip() for k in it.get("key_points", []) if str(k).strip()],
-                        "related": [str(r).strip() for r in it.get("related", []) if str(r).strip()],
-                        "source": fp.name,
-                    })
-            except Exception as e:
-                _report(f"    第 {ci+1} 块编译失败：{e}")
+                cat = str(it.get("category", "其他")).strip()
+                if cat not in CATEGORY_LIST:
+                    cat = "其他"
+                all_items.append({
+                    "title": title,
+                    "category": cat,
+                    "summary": str(it.get("summary", "")).strip(),
+                    "key_points": [str(k).strip() for k in it.get("key_points", []) if str(k).strip()],
+                    "related": [str(r).strip() for r in it.get("related", []) if str(r).strip()],
+                    "source": fp.name,
+                })
     if not all_items:
         _report("未编译出任何词条，请检查资料内容或稍后重试")
         return None
