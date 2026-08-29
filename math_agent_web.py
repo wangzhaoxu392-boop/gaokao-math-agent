@@ -174,6 +174,38 @@ def run_wiki_lint():
     yield result.get("log", "自检完成")
 
 
+def run_wiki_heal():
+    yield "⏳ Wiki 修复中（自动重定向断裂链接/降级为纯文本）...\n", None
+    progress = []
+    done = threading.Event()
+    result = {}
+
+    def worker():
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                maa.wiki_heal(progress_cb=progress.append)
+        except Exception as e:
+            progress.append(f"[错误] {e}")
+        finally:
+            result["log"] = buf.getvalue()
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    acc = "⏳ 修复中...\n"
+    seen = 0
+    while not done.is_set():
+        while seen < len(progress):
+            acc += progress[seen] + "\n"
+            seen += 1
+        yield acc, None
+        time.sleep(1.0)
+    while seen < len(progress):
+        acc += progress[seen] + "\n"
+        seen += 1
+    yield result.get("log", "修复完成"), _wiki_status()
+
+
 # ==================== 功能3：批量做题 ====================
 def refresh_batch():
     return gr.update(choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
@@ -324,6 +356,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             btn_wiki_build = gr.Button("编译 Wiki 知识库", variant="primary")
             btn_wiki_lint = gr.Button("Wiki 自检")
+            btn_wiki_heal = gr.Button("Wiki 修复（自动修断裂链接）")
         wiki_status = gr.Textbox(
             label="Wiki 概况", value=_wiki_status(), interactive=False, lines=2)
         kb_log = gr.Textbox(label="Wiki 日志", lines=12, interactive=False)
@@ -332,6 +365,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
                          outputs=[kb_msg, kb_files])
         btn_wiki_build.click(run_build_wiki, outputs=[kb_log, wiki_status])
         btn_wiki_lint.click(run_wiki_lint, outputs=[kb_log])
+        btn_wiki_heal.click(run_wiki_heal, outputs=[kb_log, wiki_status])
         btn_build_legacy.click(build_kb, outputs=[kb_log])
 
     # ---------- 功能3 ----------

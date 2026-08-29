@@ -457,6 +457,65 @@ def wiki_lint(progress_cb=None):
     return issues
 
 
+def wiki_heal(progress_cb=None):
+    """Karpathy 自检修复：扫描所有断裂链接，自动重定向到最匹配词条或降级为纯文本，
+    保证 wiki 内不再有指向不存在词条的链接。修复后重建索引。"""
+    def _report(m):
+        if progress_cb is not None:
+            try:
+                progress_cb(m)
+            except Exception:
+                pass
+        print(m)
+    wiki_root = Path(WIKI_FOLDER)
+    if not (wiki_root / "_meta.json").exists():
+        _report("尚未编译 Wiki，请先点击「编译 Wiki 知识库」")
+        return None
+    pages = [p for p in wiki_root.rglob("*.md") if p.name != "index.md"]
+    titles = {p.stem for p in pages}
+    categories = set(CATEGORY_LIST) | {"其他"}
+    link_re = re.compile(r"\[\[([^\]|]+)\]\]")
+    redirected, downgraded = 0, 0
+    detail = []
+    for p in pages:
+        text = p.read_text(encoding="utf-8")
+        def repl(m):
+            nonlocal redirected, downgraded
+            target = m.group(1).strip()
+            if target in titles:
+                return m.group(0)  # 有效链接，保留
+            # 1) 目标是分类名（如「导数」「三角」）→ 分类不是词条，降级为纯文本
+            if target in categories:
+                downgraded += 1
+                detail.append(f"降级：{p.stem} → 「{target}」(分类名)")
+                return target
+            # 2) 目标与某个已有词条标题互为子串 → 重定向到最匹配的词条
+            best = None
+            for t in titles:
+                if target == t:
+                    best = t
+                    break
+                if target in t or t in target:
+                    if best is None or len(t) < len(best):
+                        best = t
+            if best:
+                redirected += 1
+                detail.append(f"重定向：{p.stem} → 「{target}」→「{best}」")
+                return f"[[{best}]]"
+            # 3) 无法匹配 → 降级为纯文本
+            downgraded += 1
+            detail.append(f"降级：{p.stem} → 「{target}」(无匹配)")
+            return target
+        new_text = link_re.sub(repl, text)
+        if new_text != text:
+            p.write_text(new_text, encoding="utf-8")
+    _rebuild_wiki_index(wiki_root)
+    _report(f"✅ Wiki 修复完成：重定向 {redirected} 个链接，降级为纯文本 {downgraded} 个")
+    for d in detail:
+        _report(f"  · {d}")
+    return redirected, downgraded
+
+
 def _rebuild_wiki_index(wiki_root: Path):
     """按现有词条文件重建总索引"""
     cats = {}
