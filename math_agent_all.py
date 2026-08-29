@@ -60,15 +60,31 @@ llm_fast = ChatOllama(
     timeout=300
 )
 
-# 数学专用模型：计算密集型题目（求导/解方程/圆锥曲线/概率等）更精准
-# 可用 .env 的 MATH_MODEL 覆盖；默认 qwen2.5-math:14b
-llm_math = ChatOllama(
-    base_url=os.getenv("OLLAMA_BASE_URL"),
-    model=os.getenv("MATH_MODEL", "qwen2.5-math:14b"),
-    temperature=0.1,
-    num_predict=3072,
-    timeout=900
-)
+# 数学专用模型：支持本地 Ollama（免费）或硅基流动 API（免费额度内，72B数学模型更准）
+# .env 配置：MATH_PROVIDER=ollama 或 siliconflow；MATH_MODEL=模型名
+_MATH_PROVIDER = os.getenv("MATH_PROVIDER", "ollama").lower()
+_MATH_MODEL_NAME = os.getenv("MATH_MODEL", "qwen2.5:14b")
+
+if _MATH_PROVIDER == "siliconflow":
+    from langchain_openai import ChatOpenAI
+    llm_math = ChatOpenAI(
+        model=_MATH_MODEL_NAME,
+        api_key=os.getenv("SILICONFLOW_API_KEY", ""),
+        base_url="https://api.siliconflow.cn/v1",
+        temperature=0.1,
+        max_tokens=3072,
+        timeout=120
+    )
+    print(f"[模型] 数学模型使用硅基流动 API: {_MATH_MODEL_NAME}")
+else:
+    llm_math = ChatOllama(
+        base_url=os.getenv("OLLAMA_BASE_URL"),
+        model=_MATH_MODEL_NAME,
+        temperature=0.1,
+        num_predict=3072,
+        timeout=900
+    )
+    print(f"[模型] 数学模型使用本地 Ollama: {_MATH_MODEL_NAME}")
 
 CATEGORY_LIST = ["集合", "函数", "导数", "三角", "数列", "立体几何", "圆锥曲线", "概率统计"]
 
@@ -155,12 +171,12 @@ def resolve_model(choice: str, question: str):
     if choice == "reasoning":
         return llm_with_tools, llm, "DeepSeek-R1（推理模型）"
     if choice == "math":
-        return llm_math_with_tools, llm_math, "Qwen2.5-14B（数学模型）"
+        return llm_math_with_tools, llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}）"
     # auto
     routed = route_model(question)
     if routed == "reasoning":
         return llm_with_tools, llm, "DeepSeek-R1（推理模型·自动）"
-    return llm_math_with_tools, llm_math, "Qwen2.5-14B（数学模型·自动）"
+    return llm_math_with_tools, llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
 
 # ========================B RAG知识库模块【升级支持pdf、docx】========================
 def read_knowledge_file(filepath: Path) -> str:
