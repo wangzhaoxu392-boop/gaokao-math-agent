@@ -38,6 +38,11 @@ WIKI_DB_PATH = "./db_wiki"
 for p in [CHROMA_DB_PATH, KNOWLEDGE_FOLDER, BATCH_INPUT_FOLDER, OUTPUT_FOLDER, RAW_EXAM_FOLDER, OUT_RESEARCH_FOLDER, WIKI_FOLDER, WIKI_DB_PATH]:
     os.makedirs(p, exist_ok=True)
 
+# 扩展 LangGraph 状态：增加模型选择字段，支持按题型自动路由 / 手动切换
+class SolveState(MessagesState):
+    model_choice: str   # "auto" / "reasoning" / "math"
+    model_used: str     # 实际使用的模型名称（用于输出标注）
+
 llm = ChatOllama(
     base_url=os.getenv("OLLAMA_BASE_URL"),
     model=os.getenv("LLM_MODEL"),
@@ -53,6 +58,16 @@ llm_fast = ChatOllama(
     temperature=0.1,
     num_predict=2048,
     timeout=300
+)
+
+# 数学专用模型：计算密集型题目（求导/解方程/圆锥曲线/概率等）更精准
+# 可用 .env 的 MATH_MODEL 覆盖；默认 qwen2.5-math:14b
+llm_math = ChatOllama(
+    base_url=os.getenv("OLLAMA_BASE_URL"),
+    model=os.getenv("MATH_MODEL", "qwen2.5-math:14b"),
+    temperature=0.1,
+    num_predict=3072,
+    timeout=900
 )
 
 CATEGORY_LIST = ["集合", "函数", "导数", "三角", "数列", "立体几何", "圆锥曲线", "概率统计"]
@@ -119,6 +134,33 @@ def plot_function(expr_str: str, x_range: tuple = (-10, 10)) -> str:
 
 tools = [sympy_math_calc, plot_function]
 llm_with_tools = llm.bind_tools(tools)
+llm_math_with_tools = llm_math.bind_tools(tools)
+
+# ======================== 模型路由：按题型自动选择推理模型 / 数学模型 ========================
+_REASONING_KEYWORDS = re.compile(
+    r"证明|求证|是否存在|存不存在|探究|探讨|讨论|说明理由|为什么|分析.*原因|"
+    r"比较.*大小|判断.*是否|试问|阐述|论述"
+)
+
+def route_model(question: str) -> str:
+    """根据题目关键词自动路由：返回 'reasoning'（DeepSeek推理）或 'math'（Qwen数学）。
+    证明/探究/存在性等推理密集型 → DeepSeek-R1；
+    计算/方程/圆锥曲线/概率等计算密集型（默认）→ Qwen2.5-Math。"""
+    if _REASONING_KEYWORDS.search(question):
+        return "reasoning"
+    return "math"
+
+def resolve_model(choice: str, question: str):
+    """根据用户选择（auto/reasoning/math）+ 题目，返回 (带工具模型, 纯文本模型, 模型显示名)。"""
+    if choice == "reasoning":
+        return llm_with_tools, llm, "DeepSeek-R1（推理模型）"
+    if choice == "math":
+        return llm_math_with_tools, llm_math, "Qwen2.5-14B（数学模型）"
+    # auto
+    routed = route_model(question)
+    if routed == "reasoning":
+        return llm_with_tools, llm, "DeepSeek-R1（推理模型·自动）"
+    return llm_math_with_tools, llm_math, "Qwen2.5-14B（数学模型·自动）"
 
 # ========================B RAG知识库模块【升级支持pdf、docx】========================
 def read_knowledge_file(filepath: Path) -> str:
@@ -684,8 +726,11 @@ def solve_agent(state: MessagesState):
     if decompose_note:
         messages.append({"role": "system", "content": decompose_note})
     messages.append({"role": "user", "content": user_content})
-    ai_msg = llm_with_tools.invoke(messages)
-    return {"messages": [ai_msg]}
+    # 按题型自动路由 / 手动选择模型
+    choice = state.get("model_choice", "auto")
+    model_tools, model_plain, model_name = resolve_model(choice, user_content)
+    ai_msg = model_tools.invoke(messages)
+    return {"messages": [ai_msg], "model_used": model_name}
 
 def checker_agent(state: MessagesState):
     # 使用解析后的完整题目（含承接的上一题），确保复核时不会丢失指代上下文
@@ -712,8 +757,10 @@ def checker_agent(state: MessagesState):
 - 每条步骤必须确定、正确：禁止出现“似乎”“可能”“需要进一步验证”等探索性或不确定表述；若有疑问，独立重新计算得出确定结论，不要写出探索过程。
 - 步骤详略适中（一般 3～8 步），不写与解题无关的文字。最后给出【答案】汇总各小问结论。
 """
-    resp = llm.invoke([{"role": "user", "content": check_prompt}])
-    return {"messages": [resp]}
+    choice = state.get("model_choice", "auto")
+    _, model_plain, model_name = resolve_model(choice, user_content)
+    resp = model_plain.invoke([{"role": "user", "content": check_prompt}])
+    return {"messages": [resp], "model_used": model_name}
 
 def clean_model_answer(text: str) -> str:
     """清理模型输出中的 DeepSeek 特殊标记与 Markdown/LaTeX 残留，避免 Word 文档出现乱码和重复"""    # 1) 去掉 deepseek-r1 的 response / thinking 特殊标记；
@@ -734,16 +781,22 @@ def clean_model_answer(text: str) -> str:
     return '\n'.join(lines).strip()
 
 
-def run_question(graph, question: str, config, max_tries: int = 2) -> str:
-    """统一答题入口：调用图解题并清洗输出；若模型只输出推理、正文为空，自动重试一次"""
+def run_question(graph, question: str, config, max_tries: int = 2, model_choice: str = "auto"):
+    """统一答题入口：调用图解题并清洗输出；若模型只输出推理、正文为空，自动重试。
+    model_choice: "auto"(按题型自动路由) / "reasoning"(DeepSeek) / "math"(Qwen数学)。
+    返回 (清洗后答案, 实际使用的模型名)。"""
     ans = ""
+    model_used = "未知"
     for attempt in range(max_tries):
-        res = graph.invoke({"messages": [{"role": "user", "content": question}]}, config=config)
+        res = graph.invoke(
+            {"messages": [{"role": "user", "content": question}], "model_choice": model_choice},
+            config=config)
         ans = clean_model_answer(res["messages"][-1].content)
+        model_used = res.get("model_used", "未知")
         if len(ans) >= 20:
-            return ans
+            return ans, model_used
         print(f"⚠️ 本次未生成有效答案（模型可能只输出了推理过程），第{attempt + 1}次重试中...")
-    return ans
+    return ans, model_used
 
 
 def _find_matching_brace(s: str, start: int) -> int:
@@ -880,7 +933,7 @@ def should_continue(state: MessagesState):
         return "checker"
     return "__end__"
 
-builder = StateGraph(MessagesState)
+builder = StateGraph(SolveState)
 builder.add_node("decompose", decompose_problem)
 builder.add_node("solve_agent", solve_agent)
 builder.add_node("tools", tool_node)

@@ -71,20 +71,21 @@ def clear_memory():
     except Exception as e:
         return f"清空失败：{e}"
 
-def solve_one(question):
+def solve_one(question, model_choice):
     if not question or not question.strip():
         yield "请输入题目。", None
         return
-    yield "⏳ 正在解题中（简单题约1分钟，大题约3~5分钟），请勿关闭页面，耐心等待...", None
+    model_label = {"auto": "自动（按题型）", "reasoning": "DeepSeek推理", "math": "Qwen数学"}.get(model_choice, model_choice)
+    yield f"⏳ 正在解题中（模型：{model_label}，简单题约1分钟，大题约3~5分钟），请勿关闭页面，耐心等待...", None
     cfg = {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": 10}
     plot = OUTPUT_FOLDER / "plot_out.png"
     before = plot.stat().st_mtime if plot.exists() else None
     t0 = time.time()
-    ans = maa.run_question(maa.graph_chat, question, cfg)
+    ans, model_used = maa.run_question(maa.graph_chat, question, cfg, model_choice=model_choice)
     dt = time.time() - t0
     after = plot.stat().st_mtime if plot.exists() else None
     img = str(plot) if (after and after != before) else None
-    yield f"（本题用时 {dt:.0f} 秒）\n\n{ans}", img
+    yield f"（本题用时 {dt:.0f} 秒，使用模型：{model_used}）\n\n{ans}", img
 
 
 # ==================== 功能2：LLM Wiki 知识库（Karpathy 改造） ====================
@@ -332,11 +333,16 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
             label="输入题目（可含多小问，如“已知 f(x)=... (1)求... (2)证明...”），支持追问，如“那它的极值呢”",
             lines=4, placeholder="例如：求函数 y = x^2 - 4x + 3 的单调区间和极值")
         with gr.Row():
-            btn_solve = gr.Button("开始解答", variant="primary")
-            btn_clear = gr.Button("清空记忆")
+            model_choice = gr.Dropdown(
+                label="解题模型",
+                choices=[("自动（按题型切换）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("Qwen2.5-Math 数学", "math")],
+                value="auto",
+                scale=2)
+            btn_solve = gr.Button("开始解答", variant="primary", scale=1)
+            btn_clear = gr.Button("清空记忆", scale=1)
         out_text = gr.Textbox(label="解答结果", lines=20, interactive=False)
         out_plot = gr.Image(label="函数图像（如有）", type="filepath", visible=True)
-        btn_solve.click(solve_one, inputs=[q_input], outputs=[out_text, out_plot])
+        btn_solve.click(solve_one, inputs=[q_input, model_choice], outputs=[out_text, out_plot])
         btn_clear.click(clear_memory, outputs=[out_text])
 
     # ---------- 功能2 ----------
