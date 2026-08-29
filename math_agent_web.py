@@ -346,7 +346,13 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         out_plot = gr.Image(label="函数图像（如有）", type="filepath", visible=True)
         btn_solve.click(solve_one, inputs=[q_input, model_choice], outputs=[out_text, out_plot])
         btn_clear.click(clear_memory, outputs=[out_text])
-        btn_balance.click(lambda: maa.query_siliconflow_balance()[1], outputs=[balance_text])
+        def _check_balance():
+            try:
+                ok, msg = maa.query_siliconflow_balance()
+                return msg
+            except Exception as e:
+                return f"⚠️ 查询出错：{type(e).__name__}: {str(e)[:200]}\n请手动查看：https://siliconflow.cn/account/fee"
+        btn_balance.click(_check_balance, outputs=[balance_text])
 
     # ---------- 功能2 ----------
     with gr.Tab("② LLM Wiki 知识库"):

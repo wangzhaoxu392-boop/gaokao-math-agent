@@ -128,7 +128,7 @@ def query_siliconflow_balance():
         resp = requests.get(
             "https://api.siliconflow.com/v1/user/info",
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15
+            timeout=8
         )
         if resp.status_code == 200:
             d = resp.json().get("data", {})
