@@ -4,6 +4,7 @@ import re
 import json
 import time
 import sqlite3
+import requests
 from pathlib import Path
 import matplotlib.pyplot as plt
 import sympy
@@ -87,6 +88,87 @@ else:
     print(f"[模型] 数学模型使用本地 Ollama: {_MATH_MODEL_NAME}")
 
 CATEGORY_LIST = ["集合", "函数", "导数", "三角", "数列", "立体几何", "圆锥曲线", "概率统计"]
+
+# ========================API余额查询与用量统计========================
+_USAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_usage.json")
+
+def _load_usage():
+    if os.path.exists(_USAGE_FILE):
+        try:
+            with open(_USAGE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"api_problems_solved": 0, "estimated_cost_cny": 0.0, "last_balance": None}
+
+def _save_usage(data):
+    try:
+        with open(_USAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def record_api_usage(estimated_cost=0.015):
+    """记录一次 API 数学模型解题用量"""
+    if _MATH_PROVIDER != "siliconflow":
+        return
+    data = _load_usage()
+    data["api_problems_solved"] = data.get("api_problems_solved", 0) + 1
+    data["estimated_cost_cny"] = round(data.get("estimated_cost_cny", 0.0) + estimated_cost, 4)
+    _save_usage(data)
+
+def query_siliconflow_balance():
+    """查询硅基流动账户余额。返回 (成功标志, 消息文本)"""
+    if _MATH_PROVIDER != "siliconflow":
+        return False, f"当前数学模型使用本地 Ollama（{_MATH_MODEL_NAME}），不涉及 API 费用。"
+    api_key = os.getenv("SILICONFLOW_API_KEY", "")
+    if not api_key:
+        return False, "未配置 SILICONFLOW_API_KEY，请在 .env 中设置。"
+    try:
+        resp = requests.get(
+            "https://api.siliconflow.com/v1/user/info",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            d = resp.json().get("data", {})
+            usage = _load_usage()
+            msg = (
+                f"💰 硅基流动账户余额\n"
+                f"  可用余额：¥{d.get('balance', '?')}\n"
+                f"  充值余额：¥{d.get('chargeBalance', '?')}\n"
+                f"  总余额：¥{d.get('totalBalance', '?')}\n"
+                f"  账户状态：{d.get('status', '?')}\n"
+                f"\n📊 本地用量统计\n"
+                f"  API 解题次数：{usage.get('api_problems_solved', 0)}\n"
+                f"  预估费用：¥{usage.get('estimated_cost_cny', 0):.4f}\n"
+                f"  （每题约 ¥0.01~0.02，推理题走本地模型免费）"
+            )
+            usage["last_balance"] = d.get("balance")
+            _save_usage(usage)
+            return True, msg
+        else:
+            usage = _load_usage()
+            msg = (
+                f"⚠️ 余额查询失败（HTTP {resp.status_code}）\n"
+                f"  硅基流动国内站 API Key 可能不支持在线查询余额。\n"
+                f"  请手动查看：https://siliconflow.cn/account/fee\n\n"
+                f"📊 本地用量统计\n"
+                f"  API 解题次数：{usage.get('api_problems_solved', 0)}\n"
+                f"  预估费用：¥{usage.get('estimated_cost_cny', 0):.4f}\n"
+                f"  剩余额度 ≈ 初始余额 - 预估费用（请在费用中心确认准确余额）"
+            )
+            return False, msg
+    except Exception as e:
+        usage = _load_usage()
+        msg = (
+            f"⚠️ 余额查询异常：{str(e)[:100]}\n"
+            f"  请手动查看：https://siliconflow.cn/account/fee\n\n"
+            f"📊 本地用量统计\n"
+            f"  API 解题次数：{usage.get('api_problems_solved', 0)}\n"
+            f"  预估费用：¥{usage.get('estimated_cost_cny', 0):.4f}"
+        )
+        return False, msg
 
 # ========================工具定义========================
 @tool
@@ -810,6 +892,8 @@ def run_question(graph, question: str, config, max_tries: int = 2, model_choice:
         ans = clean_model_answer(res["messages"][-1].content)
         model_used = res.get("model_used", "未知")
         if len(ans) >= 20:
+            if "siliconflow" in model_used.lower():
+                record_api_usage()
             return ans, model_used
         print(f"⚠️ 本次未生成有效答案（模型可能只输出了推理过程），第{attempt + 1}次重试中...")
     return ans, model_used

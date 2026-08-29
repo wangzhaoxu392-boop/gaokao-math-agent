@@ -335,15 +335,18 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             model_choice = gr.Dropdown(
                 label="解题模型",
-                choices=[("自动（按题型切换）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("Qwen2.5-Math 数学", "math")],
+                choices=[("自动（按题型切换）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
                 value="auto",
                 scale=2)
             btn_solve = gr.Button("开始解答", variant="primary", scale=1)
             btn_clear = gr.Button("清空记忆", scale=1)
+            btn_balance = gr.Button("查询API余额", scale=1)
         out_text = gr.Textbox(label="解答结果", lines=20, interactive=False)
+        balance_text = gr.Textbox(label="API余额与用量", lines=6, interactive=False, visible=True)
         out_plot = gr.Image(label="函数图像（如有）", type="filepath", visible=True)
         btn_solve.click(solve_one, inputs=[q_input, model_choice], outputs=[out_text, out_plot])
         btn_clear.click(clear_memory, outputs=[out_text])
+        btn_balance.click(lambda: maa.query_siliconflow_balance()[1], outputs=[balance_text])
 
     # ---------- 功能2 ----------
     with gr.Tab("② LLM Wiki 知识库"):
