@@ -60,11 +60,42 @@ CATEGORY_LIST = ["集合", "函数", "导数", "三角", "数列", "立体几何
 # ========================工具定义========================
 @tool
 def sympy_math_calc(code: str) -> str:
-    """符号数学计算：求导、解方程、不等式、数列求和"""
+    """符号数学计算：求导、解方程、不等式、数列求和。
+    已预定义符号 x,y,z,a,b,c,n,k,t（均为 sympy.Symbol），可直接使用；也可自行定义新符号。
+    解方程时自动给出数值解并标注实根/复根。"""
     try:
-        namespace = {"sympy": sympy}
-        res = eval(code, namespace)
-        return f"计算结果：{str(res)} \nLaTeX公式：{sympy.latex(res)}"
+        namespace = {"sympy": sympy, "sp": sympy}
+        for name in ["x", "y", "z", "a", "b", "c", "n", "k", "t"]:
+            namespace[name] = sympy.Symbol(name)
+        # 先尝试 eval（纯表达式），失败则 exec（含赋值语句，取 result/ans 变量）
+        try:
+            res = eval(code, namespace)
+        except SyntaxError:
+            exec(code, namespace)
+            res = namespace.get("result", namespace.get("ans", "（执行完成，无返回值）"))
+        # 若是解列表（解方程结果），自动转数值并标注实根/复根，避免返回复杂精确式
+        if isinstance(res, (list, tuple)):
+            lines = [f"计算结果（共{len(res)}个解）："]
+            for i, r in enumerate(res):
+                try:
+                    num = sympy.N(r, 6)
+                    is_real = bool(sympy.im(r).simplify() == 0)
+                    tag = "实根" if is_real else "复根"
+                    exact_str = str(r)
+                    if len(exact_str) > 80:
+                        exact_str = exact_str[:77] + "..."
+                    lines.append(f"  解{i+1} [{tag}]: 数值={num}, 精确={exact_str}")
+                except Exception:
+                    lines.append(f"  解{i+1}: {r}")
+            return "\n".join(lines)
+        # 普通结果：若表达式复杂，同时给数值近似
+        try:
+            num = sympy.N(res, 6)
+            if str(num) != str(res) and len(str(res)) > 40:
+                return f"计算结果：{res}\n数值近似：{num}"
+        except Exception:
+            pass
+        return f"计算结果：{res}"
     except Exception as e:
         return f"计算工具错误：{str(e)}"
 
@@ -629,7 +660,7 @@ def solve_agent(state: MessagesState):
 参考知识库信息（仅作知识点参考）：
 {rag_ctx}
 硬性规则：
-1. 计算题、求导、解方程、求取值范围等应调用 sympy_math_calc 工具得到准确结果，禁止徒手心算；若调用工具失败，则直接给出你计算出的结果，不要反复重试工具。
+1. 计算题、求导、解方程等可调用 sympy_math_calc 工具得到准确结果；若调用工具失败，直接给出你计算的结果，不要反复重试。
 2. 用户需要图像时调用 plot_function 绘图。
 3. 禁止把 python 代码写在回答文本中，代码只能出现在工具调用里。
 4. 【重要】禁止输出 Markdown 和 LaTeX 语法（不要出现 \\[、\\]、\\(、\\)、\\frac、\\dfrac、\\boxed、\\sqrt、**、#、\\ln 等）。
@@ -641,6 +672,7 @@ def solve_agent(state: MessagesState):
 5. 输出正文就是标准答案本身，不要出现“解题思路”“考点总结”“教学点评”等多余板块，不要自我重复。
 6. 【确定正确】禁止出现“似乎”“可能”“也许”“需要进一步验证”“这没有直接帮助”等探索性或不确定表述；每一步都要给出确定、正确的结论，若有疑问就独立重新推导出确定结果。
 7. 【详略得当】步骤要完整、详细：不跳步，写清楚每一步的依据（如“由求导法则”“由对数性质”“令导数等于零”等）和中间结果；简单题也必须写完整推导，禁止只写结论；但不要写与解题无关的解释性文字。
+8. 高频易错提醒：过点求切线先验证点是否在曲线上（不在则设切点法）；不等式乘除含字母式子先判正负（负则变号）；圆锥曲线联立先写判别式再用韦达定理。
 
 输出结构（按题目小问顺序）：
 每小问：【解】以编号步骤逐条完整推导——写成“步骤1：… 步骤2：…”，每一步写明依据、公式变换和中间结果，逐步推进到结论；步骤详略适中（一般 3～8 步）。
