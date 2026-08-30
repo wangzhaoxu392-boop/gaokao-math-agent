@@ -1090,6 +1090,17 @@ def read_batch_file(filepath:Path):
     else:
         raise Exception(f"不支持文件后缀 {suffix}")
 
+def _clean_question_text(text: str) -> str:
+    """清理题目文本尾部附带的大题说明、答题要求等非题目内容。"""
+    # 截掉从"二、选择题"/"三、填空题"等大题说明开始的尾部内容
+    text = re.sub(r"\n?[一二三四五六七八九十]+、\s*(选择题|多选题|填空题|解答题)[\s\S]*$", "", text)
+    # 截掉答题要求说明
+    text = re.sub(r"在每小题给出的四个选项中[\s\S]*$", "", text)
+    text = re.sub(r"只有一项是符合题目要求[\s\S]*$", "", text)
+    text = re.sub(r"有多项符合题目要求[\s\S]*$", "", text)
+    return text.strip()
+
+
 def _is_exam_question(text: str) -> bool:
     """判断一段文本是否是真正的数学题目，过滤试卷标题、题型说明等。"""
     text_stripped = text.strip()
@@ -1125,13 +1136,14 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
     pattern = re.compile(r"(?m)^\s*\d+\s*[.、．]\s*")
     parts = pattern.split(content)
     raw_list = [p.strip() for p in parts if len(p.strip())>3]
-    # 过滤非题目内容：试卷标题、题型说明、页眉页脚等
+    # 先清理每题尾部附带的大题说明，再过滤非题目内容
     q_list = []
     for item in raw_list:
-        if _is_exam_question(item):
-            q_list.append(item)
+        cleaned = _clean_question_text(item)
+        if _is_exam_question(cleaned):
+            q_list.append(cleaned)
         else:
-            print("跳过非题目内容：" + item[:50].replace("\n", " "))
+            print("跳过非题目内容：" + cleaned[:50].replace("\n", " "))
     progress_file = Path(OUTPUT_FOLDER) / (Path(filename).stem + "_progress.json")
     all_out_items = []
     start_idx = 0
