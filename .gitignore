@@ -48,3 +48,6 @@ raw_exam_files_backup/
 # ---------- LLM Wiki 编译产物（本地生成，不上传） ----------
 wiki/
 db_wiki/
+
+# 运行时生成的API用量统计
+api_usage.json
