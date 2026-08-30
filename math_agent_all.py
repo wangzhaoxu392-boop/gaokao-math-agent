@@ -1090,6 +1090,24 @@ def read_batch_file(filepath:Path):
     else:
         raise Exception(f"不支持文件后缀 {suffix}")
 
+def _is_exam_question(text: str) -> bool:
+    """判断一段文本是否是真正的数学题目，过滤试卷标题、题型说明等。"""
+    text_stripped = text.strip()
+    if len(text_stripped) < 10:
+        return False
+    # 只过滤明显的试卷标题/页眉/大题题型说明
+    header_patterns = [
+        r"普通高等学校招生", r"全国统一考试", r"高考试题", r"高考真题",
+        r"^[一二三四五六七八九十]+、\s*(选择题|填空题|解答题|多选题)",
+        r"^第[\u2160-\u2163I]+卷", r"^注意事项", r"^考生须知",
+        r"在每小题给出的四个选项中", r"只有一项是符合题目要求",
+    ]
+    for pat in header_patterns:
+        if re.search(pat, text_stripped):
+            return False
+    return True
+
+
 def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resume=True):
     """批量解答一份试卷。支持断点续跑：每解完一题自动保存进度，中断后重新运行会跳过已完成的题。
     model_choice: auto/reasoning/math；resume: True=读取进度续跑，False=从头开始。"""
@@ -1106,7 +1124,14 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
     # 只匹配行首的数字编号，避免把题内小问 (1)(2) 或文本中的小数误拆。
     pattern = re.compile(r"(?m)^\s*\d+\s*[.、．]\s*")
     parts = pattern.split(content)
-    q_list = [p.strip() for p in parts if len(p.strip())>3]
+    raw_list = [p.strip() for p in parts if len(p.strip())>3]
+    # 过滤非题目内容：试卷标题、题型说明、页眉页脚等
+    q_list = []
+    for item in raw_list:
+        if _is_exam_question(item):
+            q_list.append(item)
+        else:
+            print("跳过非题目内容：" + item[:50].replace("\n", " "))
     progress_file = Path(OUTPUT_FOLDER) / (Path(filename).stem + "_progress.json")
     all_out_items = []
     start_idx = 0
