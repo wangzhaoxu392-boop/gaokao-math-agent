@@ -51,3 +51,6 @@ db_wiki/
 
 # 运行时生成的API用量统计
 api_usage.json
+
+# 批量做题断点续跑进度文件
+*_progress.json

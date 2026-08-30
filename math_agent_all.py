@@ -1090,8 +1090,9 @@ def read_batch_file(filepath:Path):
     else:
         raise Exception(f"不支持文件后缀 {suffix}")
 
-def batch_solve_file(filename: str, progress_cb=None, model_choice="auto"):
-    """批量解答一份试卷。model_choice: auto/reasoning/math，传递给每道题的 run_question"""
+def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resume=True):
+    """批量解答一份试卷。支持断点续跑：每解完一题自动保存进度，中断后重新运行会跳过已完成的题。
+    model_choice: auto/reasoning/math；resume: True=读取进度续跑，False=从头开始。"""
     def _report(msg):
         if progress_cb is not None:
             try:
@@ -1106,21 +1107,44 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto"):
     pattern = re.compile(r"(?m)^\s*\d+\s*[.、．]\s*")
     parts = pattern.split(content)
     q_list = [p.strip() for p in parts if len(p.strip())>3]
+    progress_file = Path(OUTPUT_FOLDER) / (Path(filename).stem + "_progress.json")
     all_out_items = []
+    start_idx = 0
+    if resume and progress_file.exists():
+        try:
+            with open(progress_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            all_out_items = saved.get("items", [])
+            start_idx = len(all_out_items)
+            if 0 < start_idx < len(q_list):
+                _report("检测到进度，已完成 " + str(start_idx) + "/" + str(len(q_list)) + " 题，从第 " + str(start_idx+1) + " 题续跑")
+        except Exception:
+            all_out_items = []
+            start_idx = 0
     thread_id = "batch_session"
     config = {"configurable":{"thread_id":thread_id}, "recursion_limit": 10}
     graph_chat.update_state(config, {"messages":[]})
-
-    _report(f"【{filename}】共识别 {len(q_list)} 道题")
-    for idx, q in enumerate(q_list):
-        _report(f"【{filename}】正在解答第 {idx+1}/{len(q_list)} 题：{q[:30]}...")
-        print(f"\n====批量处理第{idx+1}题====\n题目：{q[:80]}")
-        ans_text = run_question(graph_chat, q, config, model_choice=model_choice)
+    if start_idx == 0:
+        _report("共识别 " + str(len(q_list)) + " 道题，从头开始")
+    for idx in range(start_idx, len(q_list)):
+        q = q_list[idx]
+        _report("正在解答第 " + str(idx+1) + "/" + str(len(q_list)) + " 题：" + q[:30] + "...")
+        print("\n====批量处理第" + str(idx+1) + "题====\n题目：" + q[:80])
+        try:
+            ans_text = run_question(graph_chat, q, config, model_choice=model_choice)
+        except Exception as e:
+            ans_text = "[本题解答出错：" + type(e).__name__ + "]"
+            _report("第" + str(idx+1) + "题出错，已记录并继续")
         all_out_items.append({
             "no": idx+1,
             "question": q,
             "answer": ans_text
         })
+        try:
+            with open(progress_file, "w", encoding="utf-8") as f:
+                json.dump({"filename": filename, "total": len(q_list), "items": all_out_items}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     # 直接生成docx，不再生成md
     doc = Document()
@@ -1136,7 +1160,12 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto"):
 
     docx_save = Path(OUTPUT_FOLDER) / f"{Path(filename).stem}_result.docx"
     doc.save(str(docx_save))
-    print(f"✅批量解答保存docx：{docx_save.resolve()}")
+    print("批量解答保存docx：" + str(docx_save.resolve()))
+    try:
+        if progress_file.exists():
+            progress_file.unlink()
+    except Exception:
+        pass
 
     # 返回纯文本，用于后续生成pdf
     full_text_buf = []
