@@ -1297,7 +1297,7 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
         _report("正在解答第 " + str(idx+1) + "/" + str(len(q_list)) + " 题：" + q[:30] + "...")
         print("\n====批量处理第" + str(idx+1) + "题====\n题目：" + q[:80])
         try:
-            ans_text = run_question(graph_chat, q, config, model_choice=model_choice)
+            ans_text, _model_used = run_question(graph_chat, q, config, model_choice=model_choice)
         except Exception as e:
             ans_text = "[本题解答出错：" + type(e).__name__ + "]"
             _report("第" + str(idx+1) + "题出错，已记录并继续")
@@ -1334,7 +1334,7 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
                 _report("重做第" + str(qno) + "题：" + q[:30] + "...")
                 print("\n====重做第" + str(qno) + "题====\n题目：" + q[:80])
                 try:
-                    retry_ans = run_question(graph_chat, q, config, max_tries=3, model_choice=model_choice)
+                    retry_ans, _retry_model = run_question(graph_chat, q, config, max_tries=3, model_choice=model_choice)
                     if len(retry_ans) >= 20 and not retry_ans.startswith("[本题解答出错"):
                         it["answer"] = retry_ans
                         it["success"] = True
