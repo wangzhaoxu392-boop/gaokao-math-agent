@@ -110,7 +110,7 @@ def _wiki_status():
         return "Wiki 概况读取失败"
 
 
-def run_build_wiki():
+def run_build_wiki(model_choice="auto"):
     yield "⏳ Wiki 编译启动中（按资料量数分钟到数十分钟），实时进度如下：\n", None
     progress = []
     done = threading.Event()
@@ -120,7 +120,7 @@ def run_build_wiki():
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
-                maa.build_wiki(progress_cb=progress.append)
+                maa.build_wiki(progress_cb=progress.append, model_choice=model_choice)
         except Exception as e:
             progress.append(f"[错误] {e}")
         finally:
@@ -217,7 +217,7 @@ def upload_batch(files):
     return msg, gr.update(choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
 
 
-def run_batch(files):
+def run_batch(files, model_choice="auto"):
     if not files:
         yield "请先选择试卷文件。", None
         return
@@ -233,7 +233,7 @@ def run_batch(files):
                 for fname in files:
                     progress.append(f"=== 开始处理文件：{fname} ===")
                     full_text, docx_path = maa.batch_solve_file(
-                        fname, progress_cb=progress.append)
+                        fname, progress_cb=progress.append, model_choice=model_choice)
                     pdf_path = OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")
                     maa.text_to_pdf(full_text, str(pdf_path))
                     progress.append(f"=== {fname} 完成，已生成 Word + PDF ===")
@@ -275,7 +275,7 @@ def upload_exam(files):
     return msg, gr.update(choices=_list_files(RAW_EXAM_FOLDER, (".pdf", ".docx")))
 
 
-def run_research(files):
+def run_research(files, model_choice="auto"):
     if not files:
         yield "请先选择要教研的真题文件。", None
         return
@@ -289,7 +289,8 @@ def run_research(files):
         try:
             with redirect_stdout(buf):
                 maa.research_workflow(only_files=list(files),
-                                      progress_cb=progress.append)
+                                      progress_cb=progress.append,
+                                      model_choice=model_choice)
         except Exception as e:
             progress.append(f"[错误] {e}")
         finally:
@@ -369,16 +370,20 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
                             file_count="multiple")
         kb_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
         with gr.Row():
-            btn_wiki_build = gr.Button("编译 Wiki 知识库", variant="primary")
-            btn_wiki_lint = gr.Button("Wiki 自检")
-            btn_wiki_heal = gr.Button("Wiki 修复（自动修断裂链接）")
+            wiki_model = gr.Dropdown(
+                label="编译模型",
+                choices=[("自动（快速模型）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                value="auto", scale=2)
+            btn_wiki_build = gr.Button("编译 Wiki 知识库", variant="primary", scale=1)
+            btn_wiki_lint = gr.Button("Wiki 自检", scale=1)
+            btn_wiki_heal = gr.Button("Wiki 修复（自动修断裂链接）", scale=1)
         wiki_status = gr.Textbox(
             label="Wiki 概况", value=_wiki_status(), interactive=False, lines=2)
         kb_log = gr.Textbox(label="Wiki 日志", lines=12, interactive=False)
         btn_build_legacy = gr.Button("重建旧版 RAG 向量库（备选，未编译 Wiki 时回退用）")
         kb_upload.upload(upload_kb, inputs=[kb_upload],
                          outputs=[kb_msg, kb_files])
-        btn_wiki_build.click(run_build_wiki, outputs=[kb_log, wiki_status])
+        btn_wiki_build.click(run_build_wiki, inputs=[wiki_model], outputs=[kb_log, wiki_status])
         btn_wiki_lint.click(run_wiki_lint, outputs=[kb_log])
         btn_wiki_heal.click(run_wiki_heal, outputs=[kb_log, wiki_status])
         btn_build_legacy.click(build_kb, outputs=[kb_log])
@@ -390,8 +395,12 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
             multiselect=True,
             choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
         with gr.Row():
-            btn_refresh_b = gr.Button("刷新列表")
-            btn_batch = gr.Button("开始批量做题", variant="primary")
+            batch_model = gr.Dropdown(
+                label="解题模型",
+                choices=[("自动（按题型切换）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                value="auto", scale=2)
+            btn_refresh_b = gr.Button("刷新列表", scale=1)
+            btn_batch = gr.Button("开始批量做题", variant="primary", scale=1)
         batch_upload = gr.File(
             label="上传试卷到 batch_input（txt/md/docx/pdf）", file_count="multiple")
         batch_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
@@ -400,7 +409,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         batch_upload.upload(upload_batch, inputs=[batch_upload],
                             outputs=[batch_msg, batch_file])
         btn_refresh_b.click(refresh_batch, outputs=[batch_file])
-        btn_batch.click(run_batch, inputs=[batch_file],
+        btn_batch.click(run_batch, inputs=[batch_file, batch_model],
                         outputs=[batch_log, batch_dl])
 
     # ---------- 功能4 ----------
@@ -410,8 +419,12 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
             multiselect=True,
             choices=_list_files(RAW_EXAM_FOLDER, (".pdf", ".docx")))
         with gr.Row():
-            btn_refresh_e = gr.Button("刷新列表")
-            btn_research = gr.Button("开始真题教研", variant="primary")
+            research_model = gr.Dropdown(
+                label="分析模型",
+                choices=[("自动（推理模型）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                value="auto", scale=2)
+            btn_refresh_e = gr.Button("刷新列表", scale=1)
+            btn_research = gr.Button("开始真题教研", variant="primary", scale=1)
         exam_upload = gr.File(
             label="上传真题到 raw_exam_files（pdf/docx）", file_count="multiple")
         exam_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
@@ -420,7 +433,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         exam_upload.upload(upload_exam, inputs=[exam_upload],
                            outputs=[exam_msg, exam_file])
         btn_refresh_e.click(refresh_exam, outputs=[exam_file])
-        btn_research.click(run_research, inputs=[exam_file],
+        btn_research.click(run_research, inputs=[exam_file, research_model],
                            outputs=[exam_log, exam_dl])
 
 if __name__ == "__main__":

@@ -260,6 +260,21 @@ def resolve_model(choice: str, question: str):
         return llm_with_tools, llm, "DeepSeek-R1（推理模型·自动）"
     return llm_math_with_tools, llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
 
+def get_llm_for_choice(choice: str, default: str = "llm"):
+    """根据 model_choice 返回 (LLM实例, 显示名)，用于直接调用 .invoke() 的场景（非图模式）。
+    choice: auto / reasoning / math
+    default: auto 时用哪个模型 —— 'llm_fast'(快速编译) / 'llm'(推理分析) / 'llm_math'(数学计算)"""
+    if choice == "reasoning":
+        return llm, "DeepSeek-R1（推理模型）"
+    if choice == "math":
+        return llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}）"
+    # auto
+    if default == "llm_fast":
+        return llm_fast, "Qwen2.5-7B（快速模型·自动）"
+    if default == "llm_math":
+        return llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
+    return llm, "DeepSeek-R1（推理模型·自动）"
+
 # ========================B RAG知识库模块【升级支持pdf、docx】========================
 def read_knowledge_file(filepath: Path) -> str:
     """读取知识库文件：txt md docx pdf"""
@@ -379,8 +394,9 @@ def _safe_wiki_name(title: str) -> str:
     return t[:40] or "未命名"
 
 
-def build_wiki(progress_cb=None):
-    """Karpathy 编译：knowledge_docs → wiki/ 结构化词条 + 索引 + 向量检索库"""
+def build_wiki(progress_cb=None, model_choice="auto"):
+    """Karpathy 编译：knowledge_docs → wiki/ 结构化词条 + 索引 + 向量检索库
+    model_choice: auto(默认快速模型)/reasoning(DeepSeek)/math(API数学模型)"""
     def _report(m):
         if progress_cb is not None:
             try:
@@ -388,7 +404,8 @@ def build_wiki(progress_cb=None):
             except Exception:
                 pass
         print(m)
-    _report(f"====LLM Wiki 编译开始：读取 {KNOWLEDGE_FOLDER}====")
+    compile_llm, compile_model_name = get_llm_for_choice(model_choice, default="llm_fast")
+    _report(f"====LLM Wiki 编译开始：读取 {KNOWLEDGE_FOLDER}，编译模型：{compile_model_name}====")
     support = (".txt", ".md", ".docx", ".pdf")
     files = [f for f in Path(KNOWLEDGE_FOLDER).glob("*")
              if f.is_file() and f.suffix.lower() in support]
@@ -408,7 +425,7 @@ def build_wiki(progress_cb=None):
             arr = None
             for attempt in range(2):  # 解析失败自动重试一次
                 try:
-                    resp = llm_fast.invoke(
+                    resp = compile_llm.invoke(
                         [{"role": "user", "content": WIKI_COMPILE_PROMPT.format(chunk=ck)}])
                     m = re.search(r"\[.*\]", resp.content, re.DOTALL)
                     if m:
@@ -1073,7 +1090,8 @@ def read_batch_file(filepath:Path):
     else:
         raise Exception(f"不支持文件后缀 {suffix}")
 
-def batch_solve_file(filename: str, progress_cb=None):
+def batch_solve_file(filename: str, progress_cb=None, model_choice="auto"):
+    """批量解答一份试卷。model_choice: auto/reasoning/math，传递给每道题的 run_question"""
     def _report(msg):
         if progress_cb is not None:
             try:
@@ -1097,7 +1115,7 @@ def batch_solve_file(filename: str, progress_cb=None):
     for idx, q in enumerate(q_list):
         _report(f"【{filename}】正在解答第 {idx+1}/{len(q_list)} 题：{q[:30]}...")
         print(f"\n====批量处理第{idx+1}题====\n题目：{q[:80]}")
-        ans_text = run_question(graph_chat, q, config)
+        ans_text = run_question(graph_chat, q, config, model_choice=model_choice)
         all_out_items.append({
             "no": idx+1,
             "question": q,
@@ -1240,7 +1258,9 @@ def _safe_json_loads(s: str):
         return None
 
 
-def research_workflow(only_files=None, progress_cb=None):
+def research_workflow(only_files=None, progress_cb=None, model_choice="auto"):
+    """教研汇总：从 raw_exam_files 提取题目并做教研分析。
+    model_choice: auto/reasoning/math，控制题目提取和教研分析使用的模型"""
     def _report(msg):
         if progress_cb is not None:
             try:
@@ -1248,7 +1268,8 @@ def research_workflow(only_files=None, progress_cb=None):
             except Exception:
                 pass
         print(msg)
-    _report(f"====教研模块，读取文件夹 {RAW_EXAM_FOLDER}====")
+    research_llm, research_model_name = get_llm_for_choice(model_choice, default="llm")
+    _report(f"====教研模块，读取文件夹 {RAW_EXAM_FOLDER}，分析模型：{research_model_name}====")
     file_list = load_raw_exam_files()
     if only_files:
         only_set = set(only_files)
@@ -1265,7 +1286,7 @@ def research_workflow(only_files=None, progress_cb=None):
         _report(f"【{fname}】共 {len(valid_chunks)} 个有效片段")
         for ci, ck in enumerate(valid_chunks):
             _report(f"【{fname}】正在分析第 {ci+1}/{len(valid_chunks)} 段...")
-            resp_ext = llm.invoke([{"role":"user","content":EXTRACT_PROMPT.format(text_chunk=ck)}])
+            resp_ext = research_llm.invoke([{"role":"user","content":EXTRACT_PROMPT.format(text_chunk=ck)}])
             raw = resp_ext.content
             json_match = re.search(r"\[.*\]", raw, re.DOTALL)
             if not json_match:
@@ -1280,7 +1301,7 @@ def research_workflow(only_files=None, progress_cb=None):
                     q = item.get("question","")
                     cat = item.get("category","未知分类")
                     _report(f"  >>教研题目 {q[:40]}... 分类:{cat}")
-                    ana_resp = llm.invoke([{"role":"user","content":RESEARCH_PROMPT.format(q_text=q)}])
+                    ana_resp = research_llm.invoke([{"role":"user","content":RESEARCH_PROMPT.format(q_text=q)}])
                     all_research_items.append({
                         "category":cat,
                         "question":q,
