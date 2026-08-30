@@ -54,3 +54,6 @@ api_usage.json
 
 # 批量做题断点续跑进度文件
 *_progress.json
+
+_screenshot*.png
+_*.png
