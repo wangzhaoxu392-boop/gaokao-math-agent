@@ -1154,15 +1154,59 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
     success_count = sum(1 for it in all_out_items if it.get("success", True))
     fail_count = len(all_out_items) - success_count
     fail_nos = [str(it["no"]) for it in all_out_items if not it.get("success", True)]
-    _report("批量完成：共" + str(len(all_out_items)) + "题，成功" + str(success_count) + "题，失败" + str(fail_count) + "题")
+    _report("第一遍完成：共" + str(len(all_out_items)) + "题，成功" + str(success_count) + "题，失败" + str(fail_count) + "题")
+
+    # —— 自动重做错题（第二遍）——
+    retry_fixed = []
+    if fail_count > 0:
+        _report("检测到" + str(fail_count) + "道失败题，开始自动重做（第二遍，每题最多重试3次）...")
+        graph_chat.update_state(config, {"messages": []})
+        for it in all_out_items:
+            if not it.get("success", True):
+                qno = it["no"]
+                q = it["question"]
+                _report("重做第" + str(qno) + "题：" + q[:30] + "...")
+                print("\n====重做第" + str(qno) + "题====\n题目：" + q[:80])
+                try:
+                    retry_ans = run_question(graph_chat, q, config, max_tries=3, model_choice=model_choice)
+                    if len(retry_ans) >= 20 and not retry_ans.startswith("[本题解答出错"):
+                        it["answer"] = retry_ans
+                        it["success"] = True
+                        it["retry_fixed"] = True
+                        retry_fixed.append(str(qno))
+                        _report("第" + str(qno) + "题重做成功！")
+                    else:
+                        _report("第" + str(qno) + "题重做仍失败，保留原错误标记")
+                except Exception as e:
+                    _report("第" + str(qno) + "题重做出错：" + str(e)[:100])
+                # 保存进度
+                try:
+                    with open(progress_file, "w", encoding="utf-8") as f:
+                        json.dump({"filename": filename, "total": len(q_list), "items": all_out_items}, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+
+    # 重新统计（重做后）
+    success_count = sum(1 for it in all_out_items if it.get("success", True))
+    fail_count = len(all_out_items) - success_count
+    fail_nos = [str(it["no"]) for it in all_out_items if not it.get("success", True)]
+    if retry_fixed:
+        _report("第二遍重做修复了" + str(len(retry_fixed)) + "题：" + "、".join(retry_fixed))
+    _report("最终统计：共" + str(len(all_out_items)) + "题，成功" + str(success_count) + "题，失败" + str(fail_count) + "题")
     if fail_nos:
-        _report("失败题号：" + "、".join(fail_nos) + "（请在文档末尾查看错题汇总，建议单独重做这些题）")
+        _report("仍失败的题：" + "、".join(fail_nos) + "（已在文档末尾标注，建议手动检查）")
+    else:
+        _report("全部题目解答成功！")
 
     # 直接生成docx，不再生成md
     doc = Document()
     doc.add_heading(f"试卷解答：{filename}", level=1)
     for item in all_out_items:
-        status_tag = "" if item.get("success", True) else " ⚠️解答出错"
+        status_tag = ""
+        if not item.get("success", True):
+            status_tag = " ⚠️解答出错"
+        elif item.get("retry_fixed", False):
+            status_tag = " ✅重做修复"
         doc.add_heading(f"第{item['no']}题{status_tag}", level=2)
         doc.add_paragraph(f"【题目】{item['question']}")
         doc.add_paragraph("【解答】")
@@ -1177,6 +1221,8 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
     doc.add_paragraph("总题数：" + str(len(all_out_items)))
     doc.add_paragraph("成功：" + str(success_count) + "题")
     doc.add_paragraph("失败：" + str(fail_count) + "题")
+    if retry_fixed:
+        doc.add_paragraph("第二遍自动重做修复：" + str(len(retry_fixed)) + "题（第" + "、".join(retry_fixed) + "题）")
     if fail_nos:
         doc.add_paragraph("")
         doc.add_heading("失败题目汇总（建议单独重做）", level=2)
