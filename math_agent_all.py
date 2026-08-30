@@ -19,7 +19,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-import pdfplumber
+import pymupdf as fitz  # PyMuPDF，PDF文本提取+OCR
 from docx import Document
 
 plt.switch_backend('Agg')
@@ -1070,23 +1070,92 @@ memory = SqliteSaver(conn)
 graph_chat = builder.compile(checkpointer=memory)
 
 # ======================== 批量做题模块｜支持PDF输入，输出docx，不再输出md ========================
+def _repair_extracted_text(text: str) -> str:
+    """修复PDF/文档提取中的常见文本问题：行断裂、题号分离、选项混入等。"""
+    if not text or len(text.strip()) < 5:
+        return text
+    lines = text.split("\n")
+    repaired = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        # 情况1：行尾是题号（如"1."），下一行是题目内容 → 合并
+        if re.match(r"^\d+\s*[.、．]\s*$", line) and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if next_line and not re.match(r"^\d+\s*[.、．]", next_line):
+                repaired.append(line + " " + next_line)
+                i += 2
+                continue
+        # 情况2：行尾不是结束标点，且下一行不是新题/选项开头 → 合并（修复断行）
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            ends_with_terminal = re.search(r"[。！？；：）\]】]$", line)
+            next_is_new_question = re.match(r"^\d+\s*[.、．]", next_line)
+            next_is_option = re.match(r"^[A-D]\s*[.、．]", next_line)
+            next_is_section = re.match(r"^[一二三四五六七八九十]+、", next_line)
+            if (not ends_with_terminal and next_line
+                    and not next_is_new_question and not next_is_option
+                    and not next_is_section and len(next_line) > 0):
+                repaired.append(line + next_line)
+                i += 2
+                continue
+        repaired.append(line)
+        i += 1
+    result = "\n".join(repaired)
+    # 清理多余空白
+    result = re.sub(r"[ \t]+", " ", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
+def _pdf_ocr_fallback(doc) -> str:
+    """OCR兜底：对扫描版PDF逐页OCR提取文本。"""
+    text_all = ""
+    try:
+        for page in doc:
+            tp = page.get_textpage_ocr(flags=3, language="chi_sim+eng", dpi=300, full=True)
+            pt = page.get_text(textpage=tp)
+            if pt:
+                text_all += pt + "\n"
+    except Exception as e:
+        print(f"OCR失败: {e}")
+    return text_all
+
+
 def read_batch_file(filepath:Path):
     """读取batch_input支持：txt md docx pdf"""
     suffix = filepath.suffix.lower()
     if suffix == ".pdf":
         text_all = ""
-        with pdfplumber.open(filepath) as pdf:
-            for page in pdf.pages:
-                pt = page.extract_text()
-                if pt:
-                    text_all += pt + "\n"
+        doc = fitz.open(filepath)
+        for page in doc:
+            pt = page.get_text("text")
+            if pt:
+                text_all += pt + "\n"
+        doc.close()
+        # 文本修复
+        text_all = _repair_extracted_text(text_all)
+        # OCR兜底：提取文本过少（可能是扫描版）
+        if len(text_all.strip()) < 100:
+            print("PDF文本提取量过少，尝试OCR...")
+            doc = fitz.open(filepath)
+            ocr_text = _pdf_ocr_fallback(doc)
+            doc.close()
+            if len(ocr_text.strip()) > len(text_all.strip()):
+                text_all = _repair_extracted_text(ocr_text)
+                print(f"OCR提取成功，共{len(text_all)}字符")
         return text_all
     elif suffix == ".docx":
         doc = Document(filepath)
-        return "\n".join([p.text for p in doc.paragraphs])
+        raw = "\n".join([p.text for p in doc.paragraphs])
+        return _repair_extracted_text(raw)
     elif suffix in (".txt",".md"):
         with open(filepath,"r",encoding="utf-8") as f:
-            return f.read()
+            raw = f.read()
+        return _repair_extracted_text(raw)
     else:
         raise Exception(f"不支持文件后缀 {suffix}")
 
