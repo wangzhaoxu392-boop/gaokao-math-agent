@@ -1135,28 +1135,58 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
         except Exception as e:
             ans_text = "[本题解答出错：" + type(e).__name__ + "]"
             _report("第" + str(idx+1) + "题出错，已记录并继续")
+        is_error = ans_text.startswith("[本题解答出错")
         all_out_items.append({
             "no": idx+1,
             "question": q,
-            "answer": ans_text
+            "answer": ans_text,
+            "success": not is_error
         })
+        if is_error:
+            _report("第" + str(idx+1) + "题解答出错，已标记，继续下一题")
         try:
             with open(progress_file, "w", encoding="utf-8") as f:
                 json.dump({"filename": filename, "total": len(q_list), "items": all_out_items}, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
+    # 统计成功/失败
+    success_count = sum(1 for it in all_out_items if it.get("success", True))
+    fail_count = len(all_out_items) - success_count
+    fail_nos = [str(it["no"]) for it in all_out_items if not it.get("success", True)]
+    _report("批量完成：共" + str(len(all_out_items)) + "题，成功" + str(success_count) + "题，失败" + str(fail_count) + "题")
+    if fail_nos:
+        _report("失败题号：" + "、".join(fail_nos) + "（请在文档末尾查看错题汇总，建议单独重做这些题）")
+
     # 直接生成docx，不再生成md
     doc = Document()
     doc.add_heading(f"试卷解答：{filename}", level=1)
     for item in all_out_items:
-        doc.add_heading(f"第{item['no']}题", level=2)
+        status_tag = "" if item.get("success", True) else " ⚠️解答出错"
+        doc.add_heading(f"第{item['no']}题{status_tag}", level=2)
         doc.add_paragraph(f"【题目】{item['question']}")
         doc.add_paragraph("【解答】")
         for line in item["answer"].split("\n"):
             if line.strip():
                 doc.add_paragraph(line.strip())
         doc.add_paragraph("-"*60)
+
+    # 文档末尾加错题汇总
+    doc.add_page_break()
+    doc.add_heading("答题情况汇总", level=1)
+    doc.add_paragraph("总题数：" + str(len(all_out_items)))
+    doc.add_paragraph("成功：" + str(success_count) + "题")
+    doc.add_paragraph("失败：" + str(fail_count) + "题")
+    if fail_nos:
+        doc.add_paragraph("")
+        doc.add_heading("失败题目汇总（建议单独重做）", level=2)
+        for it in all_out_items:
+            if not it.get("success", True):
+                doc.add_paragraph("第" + str(it["no"]) + "题：" + it["question"][:80] + "...")
+                doc.add_paragraph("错误信息：" + it["answer"])
+                doc.add_paragraph("-" * 40)
+    else:
+        doc.add_paragraph("全部题目解答成功！")
 
     docx_save = Path(OUTPUT_FOLDER) / f"{Path(filename).stem}_result.docx"
     doc.save(str(docx_save))
