@@ -281,11 +281,12 @@ def read_knowledge_file(filepath: Path) -> str:
     suffix = filepath.suffix.lower()
     if suffix == ".pdf":
         text_buf = []
-        with pdfplumber.open(filepath) as pdf:
-            for page in pdf.pages:
-                pt = page.extract_text()
-                if pt:
-                    text_buf.append(pt)
+        doc = fitz.open(filepath)
+        for page in doc:
+            pt = page.get_text("text")
+            if pt:
+                text_buf.append(pt)
+        doc.close()
         return "\n".join(text_buf)
     elif suffix == ".docx":
         doc = Document(filepath)
@@ -1455,11 +1456,12 @@ def clean_math_symbols(text: str) -> str:
 
 def read_pdf(filepath: Path) -> str:
     text_all = ""
-    with pdfplumber.open(filepath) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text_all += clean_math_symbols(page_text) + "\n"
+    doc = fitz.open(filepath)
+    for page in doc:
+        page_text = page.get_text("text")
+        if page_text:
+            text_all += clean_math_symbols(page_text) + "\n"
+    doc.close()
     return text_all
 
 def read_docx(filepath: Path) -> str:
