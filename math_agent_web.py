@@ -319,6 +319,21 @@ def run_research(files, model_choice="auto"):
     yield f"✅ 教研完成！完整日志：\n{log}", (outs or None)
 
 
+# ==================== 功能5：文件转MD ====================
+def convert_to_md_ui(file_obj):
+    if file_obj is None:
+        return "请先上传文件。", None
+    try:
+        fpath = Path(file_obj.name) if hasattr(file_obj, "name") else Path(str(file_obj))
+        md_text, md_path = maa.convert_file_to_md(fpath)
+        preview = f"✅ 转换成功！共 {len(md_text)} 字符\n\n" + md_text[:8000]
+        if len(md_text) > 8000:
+            preview += "\n\n...（内容较长，完整内容请下载MD文件查看）"
+        return preview, md_path
+    except Exception as e:
+        return f"❌ 转换失败：{type(e).__name__}: {str(e)[:300]}", None
+
+
 # ==================== 网页界面 ====================
 with gr.Blocks(title="高考数学一体化Agent · 网页版",
                theme=gr.themes.Soft()) as demo:
@@ -435,6 +450,22 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         btn_refresh_e.click(refresh_exam, outputs=[exam_file])
         btn_research.click(run_research, inputs=[exam_file, research_model],
                            outputs=[exam_log, exam_dl])
+
+    # ---------- 功能5：文件转MD ----------
+    with gr.Tab("⑤ 文件转MD"):
+        gr.Markdown("""
+**将 DOCX / PDF / TXT 文件转换为 Markdown 格式**，公式保留为 LaTeX，方便编辑和导入知识库。
+- **PDF**：使用 pymupdf4llm，公式/表格/排版保留好
+- **DOCX**：基于 python-docx，保留标题/段落/表格结构
+- **TXT**：直接转为 MD
+转换后的文件保存在 `output_md/` 文件夹。
+""")
+        md_upload = gr.File(label="上传文件（docx/pdf/txt，单个文件）", file_count="single")
+        btn_md_convert = gr.Button("转换为 MD", variant="primary")
+        md_preview = gr.Textbox(label="MD 内容预览", lines=22, interactive=False)
+        md_dl = gr.File(label="下载 MD 文件")
+        btn_md_convert.click(convert_to_md_ui, inputs=[md_upload],
+                              outputs=[md_preview, md_dl])
 
 if __name__ == "__main__":
     # 并发设为 1，避免与本地 Ollama 单实例推理冲突

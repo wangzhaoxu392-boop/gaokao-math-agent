@@ -1159,6 +1159,66 @@ def read_batch_file(filepath:Path):
     else:
         raise Exception(f"不支持文件后缀 {suffix}")
 
+def _docx_to_md(filepath: Path) -> str:
+    """将DOCX转换为Markdown（基于python-docx，保留标题/段落/表格结构）。"""
+    from docx import Document
+    doc = Document(filepath)
+    lines = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            lines.append("")
+            continue
+        style = para.style.name if para.style else ""
+        if style.startswith("Heading 1") or "标题 1" in style or "标题1" in style:
+            lines.append(f"# {text}")
+        elif style.startswith("Heading 2") or "标题 2" in style or "标题2" in style:
+            lines.append(f"## {text}")
+        elif style.startswith("Heading 3") or "标题 3" in style or "标题3" in style:
+            lines.append(f"### {text}")
+        elif "List" in style or "列表" in style:
+            lines.append(f"- {text}")
+        else:
+            lines.append(text)
+    # 追加表格（简单转换）
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        lines.append("")
+        header = table.rows[0]
+        lines.append("| " + " | ".join(c.text.strip().replace("\n", " ") for c in header.cells) + " |")
+        lines.append("| " + " | ".join("---" for _ in header.cells) + " |")
+        for row in table.rows[1:]:
+            lines.append("| " + " | ".join(c.text.strip().replace("\n", " ") for c in row.cells) + " |")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def convert_file_to_md(filepath, output_folder=None):
+    """将文件转换为Markdown，返回(md文本, md文件路径)。
+    支持 pdf / docx / txt / md。"""
+    filepath = Path(filepath)
+    if output_folder is None:
+        output_folder = Path("output_md")
+    output_folder = Path(output_folder)
+    output_folder.mkdir(exist_ok=True)
+    suffix = filepath.suffix.lower()
+    if suffix == ".pdf":
+        import pymupdf4llm
+        md_text = pymupdf4llm.to_markdown(str(filepath))
+    elif suffix == ".docx":
+        md_text = _docx_to_md(filepath)
+    elif suffix in (".txt", ".md"):
+        with open(filepath, "r", encoding="utf-8") as f:
+            md_text = f.read()
+    else:
+        raise Exception(f"不支持的格式: {suffix}，支持 pdf/docx/txt/md")
+    md_path = output_folder / (filepath.stem + ".md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_text)
+    return md_text, str(md_path)
+
+
 def _clean_question_text(text: str) -> str:
     """清理题目文本尾部附带的大题说明、答题要求等非题目内容。"""
     # 截掉从"二、选择题"/"三、填空题"等大题说明开始的尾部内容
