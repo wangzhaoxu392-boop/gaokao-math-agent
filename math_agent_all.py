@@ -1567,8 +1567,12 @@ def research_workflow(only_files=None, progress_cb=None, model_choice="auto"):
         _report(f"【{fname}】共 {len(valid_chunks)} 个有效片段")
         for ci, ck in enumerate(valid_chunks):
             _report(f"【{fname}】正在分析第 {ci+1}/{len(valid_chunks)} 段...")
-            resp_ext = research_llm.invoke([{"role":"user","content":EXTRACT_PROMPT.format(text_chunk=ck)}])
-            raw = resp_ext.content
+            try:
+                resp_ext = research_llm.invoke([{"role":"user","content":EXTRACT_PROMPT.format(text_chunk=ck)}])
+                raw = resp_ext.content
+            except Exception as _ext_err:
+                _report(f"【{fname}】第 {ci+1}/{len(valid_chunks)} 段提取调用失败（{type(_ext_err).__name__}），跳过本段继续")
+                continue
             json_match = re.search(r"\[.*\]", raw, re.DOTALL)
             if not json_match:
                 _report(f"【{fname}】第 {ci+1}/{len(valid_chunks)} 段未提取到题目，跳过")
@@ -1734,7 +1738,7 @@ FINE_PROMPT_TEMPLATE = r"""你是资深{subject}教师与教研专家。请为�
 5. 【重难点突破】必须写清本专题的核心方法与技巧（如基本不等式的“1的代换/常数代换、拆项、凑定值、换元、放缩”等），并配1~2个典型例子说明；
 6. 【题型识别特征】至少8条；【典型易错点】至少5条；
 7. 每个板块用「【板块名】」开头，直接输出正文，不要额外解释；
-8. 总字数 5000~8000 字，保证内容丰富、可直接用于备课或学生复习。
+8. 总字数 6000~9000 字，保证内容丰富、可直接用于备课或学生复习。
 
 【去AI味·教师口吻 - 非常重要，必须严格遵守】
 1. 你是给真实高中生备课的老师，不是写报告的机器人。讲解要有老师讲课的口吻：直接、明确、有主次，像"这个考点常考，务必注意"这样的提醒；
@@ -1756,7 +1760,7 @@ def _fine_llm(model_choice="auto"):
 
 
 FINE_CONTINUE_RULES = """【数学符号书写规则】一律使用 Unicode 纯文本数学符号，禁止使用 LaTeX/Markdown 数学标记（不要出现 \\( \\)、\\[ \\]、\\frac、\\sqrt、\\geq、\\cdot、^、_、花括号等命令）；分数线用斜杠如 (a+b)/2；开方用 √；不等式用 ≥、≤、≠；乘号用 ×；上下标用 a²、b₁、aⁿ、f'(x)。写出的文本必须能直接阅读。
-【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份；重难点写清核心方法与技巧；题型识别至少8条；易错点至少5条。直接输出正文，不要额外解释。
+【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份；重难点写清核心方法与技巧；题型识别至少8条；易错点至少5条。直接输出正文，不要额外解释。【字数要求 - 必须遵守】你本次负责的 4 个板块合计至少 2000 字，题型板块（含题目与解析）务必展开写满，宁可详实不可简略；每个板块都要有实质内容，禁止只用一行带过。
 【去AI味·教师口吻】用老师讲课的口吻，直接、明确、有主次；禁用套话连接词（首先/其次/此外/值得注意的是/综上所述）；禁用"不是A而是B"等强行洞察句；不写空泛形容词堆砌；结尾不强行升华；例题先说"为什么这样想"再给步骤；允许自然教学习惯语（注意/这里容易错）；去AI味绝不牺牲公式定理与步骤的准确性。"""
 
 def generate_fine_content(subject="数学", topic="函数单调性", model_choice="auto", progress_cb=None):
@@ -1797,17 +1801,29 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
                 + FINE_CONTINUE_RULES
             )
         cb(f"[{topic}] 正在生成第 {bi+1}/{len(batches)} 批（板块 {nums_str if bi>0 else '1-4'}）...")
-        try:
-            resp = llm_obj.invoke(prompt)
-            text = resp.content if hasattr(resp, "content") else str(resp)
-            text = text.strip()
-            if not text:
-                return "", label, f"第{bi+1}批返回为空"
-            parts.append(text)
-            total += len(text)
-            cb(f"[{topic}] 第 {bi+1} 批完成（{len(text)} 字符）")
-        except Exception as e:
-            return "", label, f"第{bi+1}批模型调用失败：{str(e)}"
+        text = ""
+        for attempt in range(2):
+            try:
+                resp = llm_obj.invoke(prompt)
+                text = resp.content if hasattr(resp, "content") else str(resp)
+                text = text.strip()
+                if not text:
+                    return "", label, f"第{bi+1}批返回为空"
+                # 最低字数检查：每批4个板块至少1400字，不足则重试一次
+                min_chars = 1400
+                if len(text) < min_chars and attempt == 0:
+                    cb(f"[{topic}] 第 {bi+1} 批仅 {len(text)} 字（低于{min_chars}），重新生成一次...")
+                    prompt = prompt + f"\n\n【注意】你上一次输出太简略（仅 {len(text)} 字），请务必把本次的 4 个板块写充实：每道题给出完整题面+分步解析+最终答案，每个板块都要有实质内容，本次合计至少 2000 字。"
+                    continue
+                break
+            except Exception as e:
+                if attempt == 0:
+                    cb(f"[{topic}] 第 {bi+1} 批调用失败，重试一次...")
+                    continue
+                return "", label, f"第{bi+1}批模型调用失败：{str(e)}"
+        parts.append(text)
+        total += len(text)
+        cb(f"[{topic}] 第 {bi+1} 批完成（{len(text)} 字符）")
 
     # 拼接并按板块编号去重：保留每个编号第一次出现的板块内容
     def split_sections(text):

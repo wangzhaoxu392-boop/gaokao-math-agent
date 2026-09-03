@@ -81,7 +81,21 @@ def solve_one(question, model_choice):
     plot = OUTPUT_FOLDER / "plot_out.png"
     before = plot.stat().st_mtime if plot.exists() else None
     t0 = time.time()
-    ans, model_used = maa.run_question(maa.graph_chat, question, cfg, model_choice=model_choice)
+    try:
+        ans, model_used = maa.run_question(maa.graph_chat, question, cfg, model_choice=model_choice)
+    except Exception as e:
+        emsg = str(e)
+        elow = emsg.lower()
+        if any(k in elow for k in ["401", "403", "authentication", "invalid api key", "余额", "insufficient", "402"]):
+            hint = "API 密钥无效或余额不足。请到 https://siliconflow.cn/account/fee 查看余额并充值，或在 .env 检查 SILICONFLOW_API_KEY。"
+        elif any(k in elow for k in ["timeout", "timed out", "connection", "network", "连接", "超时"]):
+            hint = "网络连接超时或中断。请检查网络后重试；若持续出现，可稍后再试。"
+        elif any(k in elow for k in ["ollama", "connection refused", "拒绝连接"]):
+            hint = "本地 Ollama 服务未启动。请先在终端运行 ollama serve 或启动 Ollama 应用。"
+        else:
+            hint = f"解题出错（{type(e).__name__}）：{emsg[:200]}"
+        yield f"❌ {hint}", None
+        return
     dt = time.time() - t0
     after = plot.stat().st_mtime if plot.exists() else None
     img = str(plot) if (after and after != before) else None
@@ -246,16 +260,21 @@ def run_batch(files, model_choice="auto"):
     threading.Thread(target=worker, daemon=True).start()
     acc = "⏳ 批量做题进行中，实时进度如下：\n"
     seen = 0
+    t_start = time.time()
     while not done.is_set():
         while seen < len(progress):
             acc += progress[seen] + "\n"
             seen += 1
+        elapsed = int(time.time() - t_start)
+        if elapsed >= 60:
+            acc += f"⏱ 已运行 {elapsed//60} 分 {elapsed%60} 秒，仍在处理中请耐心等待\n"
         yield acc, None
         time.sleep(1.0)
-        time.sleep(1.5)
     while seen < len(progress):
         acc += progress[seen] + "\n"
         seen += 1
+    elapsed = int(time.time() - t_start)
+    acc += f"⏱ 总耗时 {elapsed//60} 分 {elapsed%60} 秒\n"
     log = result.get("log", "")
     outs = []
     for fname in files:
@@ -395,7 +414,13 @@ def run_fine(subject, category, topic, model_choice):
         acc += progress[seen] + "\n"
         seen += 1
     if result.get("ok"):
-        yield acc + "\n" + result.get("msg", ""), result.get("path")
+        extra = ""
+        try:
+            usage = maa._load_usage()
+            extra = f"\n\n📊 累计：API 解题 {usage.get('api_problems_solved',0)} 次，预估费用 ¥{usage.get('estimated_cost_cny',0):.4f}"
+        except Exception:
+            extra = ""
+        yield acc + "\n" + result.get("msg", "") + extra, result.get("path")
     else:
         yield acc + "\n" + result.get("msg", "生成失败"), None
 
