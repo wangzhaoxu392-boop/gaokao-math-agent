@@ -1641,6 +1641,307 @@ def research_workflow(only_files=None, progress_cb=None, model_choice="auto"):
     print(f"Word：{word_path.resolve()}")
     print(f"PDF：{(Path(OUT_RESEARCH_FOLDER)/'高考数学教研汇总.pdf').resolve()}")
 
+# ========================精细化内容生成（学科通用模板）========================
+# 学科知识体系：每个学科一个专题列表（可扩展其他学科）
+FINE_TOPICS = {
+    "数学": {
+        "第一篇 集合、逻辑与不等式基础": [
+            "1. 集合的概念与表示", "2. 集合的运算", "3. 充分条件、必要条件与量词",
+            "4. 不等式基础", "5. 基本不等式"],
+        "第二篇 函数体系": [
+            "6. 函数概念与定义域", "7. 函数单调性", "8. 函数奇偶性、周期性与对称性",
+            "9. 二次函数", "10. 指数函数与对数函数", "11. 幂函数", "12. 函数图像变换",
+            "13. 函数零点与方程", "14. 函数综合与参数"],
+        "第三篇 三角函数与解三角形": [
+            "15. 任意角与弧度制", "16. 三角函数定义与基本关系", "17. 诱导公式与恒等变换",
+            "18. 三角函数图像与性质", "19. 解三角形"],
+        "第四篇 平面向量与复数": ["20. 平面向量", "21. 复数"],
+        "第五篇 数列": [
+            "22. 数列概念与递推", "23. 等差数列", "24. 等比数列", "25. 数列求和", "26. 数列综合"],
+        "第六篇 立体几何与空间向量": [
+            "27. 空间几何体", "28. 空间点线面关系", "29. 空间平行与垂直证明", "30. 空间向量"],
+        "第七篇 解析几何": [
+            "31. 直线与斜率", "32. 圆", "33. 椭圆", "34. 双曲线", "35. 抛物线", "36. 圆锥曲线综合"],
+        "第八篇 概率统计": [
+            "37. 统计基础", "38. 抽样方法", "39. 古典概型与条件概率",
+            "40. 全概率与贝叶斯思想", "41. 离散型随机变量", "42. 二项分布与正态分布"],
+        "第九篇 计数原理与排列组合": [
+            "43. 分类加法与分步乘法", "44. 排列、组合与二项式"],
+    },
+    "物理": {
+        "第一篇 力学": [
+            "运动的描述", "匀变速直线运动", "相互作用（重力、弹力、摩擦力）", "牛顿运动定律",
+            "曲线运动与抛体", "圆周运动", "万有引力与航天", "功和功率", "动能定理", "机械能守恒定律"],
+        "第二篇 电磁学": [
+            "电场", "电势与电势能", "电容", "恒定电流", "磁场", "安培力与洛伦兹力",
+            "电磁感应", "交变电流", "变压器与远距离输电"],
+        "第三篇 热学与近代物理": [
+            "分子动理论", "气体状态方程", "热力学定律", "动量与冲量", "动量守恒定律", "原子结构", "原子核"],
+        "第四篇 实验与方法": [
+            "力学实验", "电学实验", "读数与误差分析"],
+    },
+    "化学": {
+        "第一篇 基本概念与理论": [
+            "物质的量", "化学计量与阿伏伽德罗常数", "离子反应", "氧化还原反应",
+            "元素周期律", "化学键", "化学反应速率", "化学平衡", "电离与水解", "原电池", "电解池"],
+        "第二篇 元素及其化合物": [
+            "钠及其化合物", "铝及其化合物", "铁及其化合物", "氯及其化合物", "硫及其化合物",
+            "氮及其化合物", "硅及其化合物"],
+        "第三篇 有机化学": [
+            "烷烃烯烃炔烃", "苯及芳香烃", "卤代烃", "醇酚醛", "羧酸酯", "糖类油脂蛋白质",
+            "有机合成与推断"],
+        "第四篇 化学实验与计算": [
+            "化学实验基本操作", "物质的检验与分离", "化学计算"],
+    },
+}
+
+# 12 项精细化模板的固定结构（学科无关，供 LLM 生成时遵循）
+FINE_TEMPLATE_SECTIONS = [
+    "1. 核心概念与定义",
+    "2. 必背公式/定理/定律（含常见变形与重要结论）",
+    "3. 基本性质与规律",
+    "4. A级基础题型（概念辨析、直接计算，2~3题，含完整题面与解析）",
+    "5. B级常见题型（标准方法，4~5题，含完整题面与解析，覆盖本专题核心方法）",
+    "6. C级综合题型（多知识点结合，3~4题，含完整题面与解析）",
+    "7. D级拔高题型（以历年高考/会考真题题型为主，3~4题，含完整题面与解析，注明考法）",
+    "8. 题型识别特征速查（看到XX→用XX，8条以上）",
+    "9. 标准解题方法总流程",
+    "10. 典型易错点诊断（5条以上）",
+    "11. 重难点突破（含核心方法与技巧）",
+    "12. 高考/会考真题映射与跨学科迁移",
+]
+
+FINE_PROMPT_TEMPLATE = r"""你是资深{subject}教师与教研专家。请为「{subject} · {topic}」专题编写一份完整、详实的精细化精讲讲义，严格按以下 12 个板块组织：
+
+{template}
+
+【数学符号书写规则 - 非常重要，必须严格遵守】
+1. 一律使用 Unicode 纯文本数学符号，禁止使用 LaTeX 或 Markdown 数学标记：
+   - 不要出现 \( \)、\[ \]、\frac、\sqrt、\geq、\leq、\cdot、\dots、\times、^、_、大括号 等 LaTeX 命令；
+   - 分数线用斜杠：如 a+b 除以 2 写成 (a+b)/2；
+   - 开方用 sqrt：如 √(x+1)、√3、∛；
+   - 不等式用符号：≥、≤、≠、>、<；
+   - 乘号用 × 或省略，不要用 *；
+   - 上下标用普通写法：如 a²、b³、x₁、x₂、aⁿ、f'(x)、Sₙ；
+   - 特殊符号直接写：π、±、∞、∈、⊆、∩、∪、⇒、⇔、∑、√、Δ。
+2. 写出的文本必须能直接阅读，不要留下任何 LaTeX 代码。
+
+【内容要求】
+1. 内容准确、专业，面向高中{subject}复习与备考场景；
+2. 题型部分每道题都必须给出【完整题面 + 分步解析 + 最终答案】，中档题（B/C级）要具体详细；
+3. 拔高题（D级）以历年高考/会考真题题型为主，题目标注考法与年份（如“2023全国卷”），并给出贴近高考难度的完整解析；
+4. 【必背公式/定理】板块必须补充本专题的重要变形、常见结论、推论与“秒杀结论”，例如基本不等式要包含：1的代换、凑定值、等号成立条件、调和≤几何≤算术≤平方不等式链、a²+b²≥2ab、ab≤((a+b)/2)²等；
+5. 【重难点突破】必须写清本专题的核心方法与技巧（如基本不等式的“1的代换/常数代换、拆项、凑定值、换元、放缩”等），并配1~2个典型例子说明；
+6. 【题型识别特征】至少8条；【典型易错点】至少5条；
+7. 每个板块用「【板块名】」开头，直接输出正文，不要额外解释；
+8. 总字数 5000~8000 字，保证内容丰富、可直接用于备课或学生复习。
+"""
+
+
+def _fine_llm(model_choice="auto"):
+    """获取精细化生成用的 LLM。auto 默认用数学/快速模型（免费优先），reasoning 用推理模型"""
+    llm_obj, label = get_llm_for_choice(model_choice, default="llm_fast")
+    return llm_obj, label
+
+
+FINE_CONTINUE_RULES = """【数学符号书写规则】一律使用 Unicode 纯文本数学符号，禁止使用 LaTeX/Markdown 数学标记（不要出现 \\( \\)、\\[ \\]、\\frac、\\sqrt、\\geq、\\cdot、^、_、花括号等命令）；分数线用斜杠如 (a+b)/2；开方用 √；不等式用 ≥、≤、≠；乘号用 ×；上下标用 a²、b₁、aⁿ、f'(x)。写出的文本必须能直接阅读。
+【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份；重难点写清核心方法与技巧；题型识别至少8条；易错点至少5条。直接输出正文，不要额外解释。"""
+
+def generate_fine_content(subject="数学", topic="函数单调性", model_choice="auto", progress_cb=None):
+    """生成单个专题的精细化内容（Markdown 文本）。分段生成以突破单次输出长度限制。
+    返回 (markdown文本, 模型显示名, 错误信息)"""
+    def cb(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    llm_obj, label = _fine_llm(model_choice)
+
+    # 分段：12个板块分3批，每批4个，逐批生成后拼接
+    batches = [FINE_TEMPLATE_SECTIONS[i:i+4] for i in range(0, len(FINE_TEMPLATE_SECTIONS), 4)]
+
+    # 段间引导：后一批衔接前一批，保持整体风格
+    parts = []
+    total = 0
+    for bi, batch in enumerate(batches):
+        template_lines = "\n".join(f"【{s}】" for s in batch)
+        if bi == 0:
+            prompt = FINE_PROMPT_TEMPLATE.format(subject=subject, topic=topic, template=template_lines)
+        else:
+            # 续写提示：说明已生成的前序板块，请继续后续板块
+            prev_sections = "、".join(batch for batch in FINE_TEMPLATE_SECTIONS[:bi*4])
+            prompt = (
+                f"你正在编写「{subject} · {topic}」专题的精细化精讲讲义。前面已经完成：{prev_sections}。\n"
+                f"现在请继续严格按以下板块编写（本次只输出这些板块，不要重复前序内容）：\n\n"
+                f"{template_lines}\n\n"
+                + FINE_CONTINUE_RULES
+            )
+        cb(f"[{topic}] 正在生成第 {bi+1}/{len(batches)} 批（{len(batch)} 个板块）...")
+        try:
+            resp = llm_obj.invoke(prompt)
+            text = resp.content if hasattr(resp, "content") else str(resp)
+            text = text.strip()
+            if not text:
+                return "", label, f"第{bi+1}批返回为空"
+            parts.append(text)
+            total += len(text)
+            cb(f"[{topic}] 第 {bi+1} 批完成（{len(text)} 字符）")
+        except Exception as e:
+            return "", label, f"第{bi+1}批模型调用失败：{str(e)}"
+
+    md = "\n\n".join(parts)
+    cb(f"[{topic}] 全部生成完成，共 {total} 字符")
+    return md, label, None
+
+
+def _latex_to_unicode(text):
+    """将残留的 LaTeX/Markdown 数学标记转换为可读的 Unicode 数学符号"""
+    import re as _re
+    s = text
+    # 去掉 LaTeX 内联/独立数学环境的包裹符
+    s = s.replace("\\[", "").replace("\\]", "")
+    s = s.replace("\\( ", "").replace("\\)", "").replace("\\) ", "")
+    s = s.replace("\\(", "").replace("\\)", "")
+    # 常见 LaTeX 命令 → Unicode
+    s = s.replace("\\geq", "≥").replace("\\leq", "≤").replace("\\ne", "≠")
+    s = s.replace("\\cdots", "⋯")
+    s = s.replace("\\times", "×").replace("\\cdot", "·").replace("\\pm", "±")
+    s = s.replace("\\infty", "∞").replace("\\pi", "π").replace("\\Delta", "Δ")
+    s = s.replace("\\in", "∈").replace("\\subseteq", "⊆").replace("\\cap", "∩").replace("\\cup", "∪")
+    s = s.replace("\\Rightarrow", "⇒").replace("\\Leftrightarrow", "⇔").replace("\\rightarrow", "→")
+    s = s.replace("\\dots", "…").replace("\\ldots", "…")
+    # \frac{a}{b} → (a)/(b)
+    def _frac(m):
+        a, b = m.group(1), m.group(2)
+        a2 = a.replace("{", "").replace("}", "")
+        b2 = b.replace("{", "").replace("}", "")
+        return f"({a2})/({b2})"
+    s = _re.sub(r"\\frac\{([^}]*)\}\{([^}]*)\}", _frac, s)
+    # \sqrt[n]{x} → n次根号；\sqrt{x} → √(x)
+    def _sqrt(m):
+        if m.group(1):
+            return f"∛({m.group(2)})" if m.group(1) == "3" else f"{m.group(1)}√({m.group(2)})"
+        return f"√({m.group(2)})"
+    s = _re.sub(r"\\sqrt(?:\[([^\]]*)\])?\{([^}]*)\}", _sqrt, s)
+    # \bar{z} → z̄ ; \overline{z} → z̄
+    s = _re.sub(r"\\bar\{([^}]*)\}", r"\1̄", s)
+    s = _re.sub(r"\\overline\{([^}]*)\}", r"\1̄", s)
+    # 去掉残留的反斜杠命令（未识别命令保留原字符但去掉 \）
+    s = _re.sub(r"\\[a-zA-Z]+", "", s)
+    # 下标数字/字母：a_1 → a₁, S_n → Sₙ
+    sub_map = {"0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉","n":"ₙ","i":"ᵢ","k":"ₖ","m":"ₘ","j":"ⱼ","N":"ₙ"}
+    def _sub(m):
+        return "".join(sub_map.get(c, c) for c in m.group(1))
+    s = _re.sub(r"_\{([^}]*)\}", _sub, s)
+    s = _re.sub(r"_([0-9nNkmj])", lambda m: _sub(m), s)
+    # 清理残留的花括号
+    s = s.replace("{", "").replace("}", "")
+    # 清理可能出现的 \ 和多余空格
+    s = s.replace("\\", "")
+    # 仅压缩连续空格，保留换行（保证 Word 分段）
+    s = _re.sub(r"[ ]+", " ", s)
+    s = _re.sub(r" *\n *", "\n", s)
+    return s.strip()
+
+
+def _fine_md_to_docx(md_text, subject, topic, out_path):
+    """将精细化 Markdown 文本转换为 Word 文档（结构化，带标题层级，自动清理Markdown符号）"""
+    md_text = _latex_to_unicode(md_text)
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+    from docx.oxml.ns import qn
+    import re as _re
+
+    doc = Document()
+    sec = doc.sections
+    sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
+    sec.top_margin = sec.bottom_margin = sec.left_margin = sec.right_margin = Cm(2.5)
+
+    def set_font(run, size=12, bold=False, cn="宋体", en="Arial", color=None):
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.name = en
+        r = run._element.rPr.rFonts
+        r.set(qn("w:eastAsia"), cn)
+        if color:
+            run.font.color.rgb = RGBColor(*color)
+
+    def add_center(text, size=18, bold=True, cn="黑体", after=18):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(after)
+        set_font(p.add_run(text), size=size, bold=bold, cn=cn)
+
+    def clean_md(s):
+        """清理行首的 Markdown 标记"""
+        s = s.replace("**", "").replace("__", "")  # 先删粗体标记（否则 * 会干扰列表判断）
+        s = _re.sub(r"^#{1,6}\s*", "", s)      # ### → 去
+        s = _re.sub(r"^[-*•]\s*", "• ", s)      # 列表符号统一为 •
+        s = s.replace("`", "")
+        s = _re.sub(r"^◆+", "◆ ", s)
+        return s.strip()
+
+    # 标题
+    add_center(f"{subject} · {topic} · 精细化精讲")
+
+    lines = md_text.split("\n")
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        s = clean_md(raw)
+
+        # 板块标题：【n. xxx】或 ### 【n. xxx】→ 黑体15
+        m = _re.match(r"^【(\d+[.、]?[^】]*)】\s*(.*)$", s)
+        if m:
+            sec_title = f"{m.group(1)} {m.group(2)}".strip()
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(14)
+            p.paragraph_format.space_after = Pt(6)
+            set_font(p.add_run(sec_title), size=15, bold=True, cn="黑体")
+            continue
+
+        # 子标题：题1/题2/例题1 或 1. xxx（作为小题标题）→ 宋体加粗13
+        m2 = _re.match(r"^(题\d+[、.：: ]|例\d+[、.：: ]|【?\d+\.\s*[^。]{2,20}】?$)", s)
+        is_subtitle = bool(m2) and len(s) < 40
+
+        # 普通正文（含例题等）
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        pf = p.paragraph_format
+        pf.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(0)
+        if len(s) > 0 and not s.startswith(("①", "②", "③", "④", "⑤", "⑥", "-", "•", "（", "◆")):
+            pf.first_line_indent = Pt(24)
+        if is_subtitle:
+            set_font(p.add_run(s), size=12, bold=True)
+        else:
+            set_font(p.add_run(s), size=12)
+
+    doc.save(out_path)
+
+
+def fine_generate_and_save(subject, topic, model_choice="auto", out_folder=None, progress_cb=None):
+    """精细化生成并保存 Word。返回 (成功标志, 提示信息, 文件路径)"""
+    if out_folder is None:
+        out_folder = Path(OUT_RESEARCH_FOLDER) / "精细化内容"
+    out_folder = Path(out_folder)
+    out_folder.mkdir(parents=True, exist_ok=True)
+
+    md_text, label, err = generate_fine_content(subject, topic, model_choice, progress_cb)
+    if err:
+        return False, f"❌ 生成失败：{err}", None
+
+    safe = re.sub(r'[\\/:*?"<>|]', "_", topic)
+    out_path = out_folder / f"{subject}_{safe}_精细化精讲.docx"
+    try:
+        _fine_md_to_docx(md_text, subject, topic, str(out_path))
+    except Exception as e:
+        return False, f"❌ Word 生成失败：{str(e)[:200]}", None
+
+    return True, f"✅ 已生成：{out_path.name}（模型：{label}）", str(out_path)
+
+
 # ========================主菜单========================
 def print_main_menu():
     print("""

@@ -334,6 +334,71 @@ def convert_to_md_ui(file_obj):
         return f"❌ 转换失败：{type(e).__name__}: {str(e)[:300]}", None
 
 
+# ==================== 功能6：精细化内容生成 ====================
+def fine_subjects():
+    """返回学科列表"""
+    return list(maa.FINE_TOPICS.keys())
+
+
+def fine_categories(subject):
+    """根据学科返回篇章列表"""
+    if subject in maa.FINE_TOPICS:
+        return list(maa.FINE_TOPICS[subject].keys())
+    return []
+
+
+def fine_topics(subject, category):
+    """根据学科+篇章返回专题列表"""
+    if subject in maa.FINE_TOPICS and category in maa.FINE_TOPICS[subject]:
+        return maa.FINE_TOPICS[subject][category]
+    return []
+
+
+def _fine_update_cats(subject):
+    cats = fine_categories(subject)
+    return gr.update(choices=cats, value=(cats[0] if cats else None))
+
+
+def _fine_update_topics(subject, category):
+    tops = fine_topics(subject, category)
+    return gr.update(choices=tops, value=(tops[0] if tops else None))
+
+
+def run_fine(subject, category, topic, model_choice):
+    if not topic:
+        yield "请选择专题。", None
+        return
+    yield f"⏳ 正在生成「{subject} · {topic}」精细化内容（模型：{model_choice}），约 1~3 分钟，请耐心等待...\n", None
+    progress = []
+    done = threading.Event()
+    result = {}
+
+    def worker():
+        ok, msg, path = maa.fine_generate_and_save(
+            subject, topic, model_choice,
+            out_folder=Path(maa.OUT_RESEARCH_FOLDER) / "精细化内容",
+            progress_cb=progress.append)
+        result["ok"], result["msg"], result["path"] = ok, msg, path
+        done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    acc = ""
+    seen = 0
+    while not done.is_set():
+        while seen < len(progress):
+            acc += progress[seen] + "\n"
+            seen += 1
+        yield acc, None
+        time.sleep(1.0)
+    while seen < len(progress):
+        acc += progress[seen] + "\n"
+        seen += 1
+    if result.get("ok"):
+        yield acc + "\n" + result.get("msg", ""), result.get("path")
+    else:
+        yield acc + "\n" + result.get("msg", "生成失败"), None
+
+
 # ==================== 网页界面 ====================
 with gr.Blocks(title="高考数学一体化Agent · 网页版",
                theme=gr.themes.Soft()) as demo:
@@ -466,6 +531,34 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         md_dl = gr.File(label="下载 MD 文件")
         btn_md_convert.click(convert_to_md_ui, inputs=[md_upload],
                               outputs=[md_preview, md_dl])
+
+    # ---------- 功能6：精细化内容生成 ----------
+    with gr.Tab("⑥ 精细化内容生成"):
+        gr.Markdown("""
+**按「学科通用精细化模板」（12板块）自动生成专题精讲讲义，可复用于数学/物理/化学等学科。**
+- 选择学科 → 篇章 → 专题，点击生成后由 LLM 按模板编写，自动导出 Word 文档（含核心概念、公式、ABCD四级题型与解析、易错点、重难点、真题映射）。
+- 生成文件保存在 `output_research/精细化内容/` 文件夹。
+""")
+        with gr.Row():
+            fine_subject = gr.Dropdown(
+                label="学科", choices=fine_subjects(), value="数学", scale=1)
+            fine_category = gr.Dropdown(
+                label="篇章", choices=fine_categories("数学"), value=None, scale=1)
+            fine_topic = gr.Dropdown(
+                label="专题", choices=fine_topics("数学", list(maa.FINE_TOPICS["数学"].keys())[0]),
+                value=None, scale=2)
+        with gr.Row():
+            fine_model = gr.Dropdown(
+                label="生成模型",
+                choices=[("自动（快速模型）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                value="auto", scale=2)
+            btn_fine = gr.Button("开始生成精细化讲义", variant="primary", scale=1)
+        fine_log = gr.Textbox(label="生成日志", lines=14, interactive=False)
+        fine_dl = gr.File(label="下载生成的 Word 讲义")
+        fine_subject.change(_fine_update_cats, inputs=[fine_subject], outputs=[fine_category])
+        fine_category.change(_fine_update_topics, inputs=[fine_subject, fine_category], outputs=[fine_topic])
+        btn_fine.click(run_fine, inputs=[fine_subject, fine_category, fine_topic, fine_model],
+                       outputs=[fine_log, fine_dl])
 
 if __name__ == "__main__":
     # 并发设为 1，避免与本地 Ollama 单实例推理冲突
