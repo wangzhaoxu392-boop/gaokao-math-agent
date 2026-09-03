@@ -1735,6 +1735,17 @@ FINE_PROMPT_TEMPLATE = r"""你是资深{subject}教师与教研专家。请为�
 6. 【题型识别特征】至少8条；【典型易错点】至少5条；
 7. 每个板块用「【板块名】」开头，直接输出正文，不要额外解释；
 8. 总字数 5000~8000 字，保证内容丰富、可直接用于备课或学生复习。
+
+【去AI味·教师口吻 - 非常重要，必须严格遵守】
+1. 你是给真实高中生备课的老师，不是写报告的机器人。讲解要有老师讲课的口吻：直接、明确、有主次，像"这个考点常考，务必注意"这样的提醒；
+2. 禁用套话连接词：不要出现"首先、其次、最后、此外、值得注意的是、不可否认、综上所述、总而言之、众所周知"这类机械过渡词，直接用内容推进；
+3. 禁用强行洞察句式：不要用"不是A而是B""不仅是X更是Y""核心就一句话""归根结底"这类制造深刻感的表达；
+4. 禁用空泛形容词和虚词：不要用"非常重要、非常关键、深刻的、全面的、系统性的"堆砌，把判断落到具体内容上（如"这里漏掉等号条件会失分"）；
+5. 结尾不要强行升华：不要写"掌握这些就能……""数学是思维的体操"之类；板块结尾可以停在具体方法、易错提醒或下一板块的自然衔接；
+6. 结构要真实：允许一句话短句、允许板块长短不一，不要每段都写成"观点+解释+例子+总结"的四段式；
+7. 例题讲解要说清"为什么这样想"：先给思路（看到什么条件→想到什么方法），再给步骤，不要只机械罗列计算过程；
+8. 允许自然的教学习惯用语：如"注意""这里容易错""考试时""这类题一般先……"，但不要过量堆砌；
+9. 去AI味绝不牺牲准确性：公式、定理、术语、步骤必须完整准确，专业严谨始终优先。
 """
 
 
@@ -1745,11 +1756,14 @@ def _fine_llm(model_choice="auto"):
 
 
 FINE_CONTINUE_RULES = """【数学符号书写规则】一律使用 Unicode 纯文本数学符号，禁止使用 LaTeX/Markdown 数学标记（不要出现 \\( \\)、\\[ \\]、\\frac、\\sqrt、\\geq、\\cdot、^、_、花括号等命令）；分数线用斜杠如 (a+b)/2；开方用 √；不等式用 ≥、≤、≠；乘号用 ×；上下标用 a²、b₁、aⁿ、f'(x)。写出的文本必须能直接阅读。
-【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份；重难点写清核心方法与技巧；题型识别至少8条；易错点至少5条。直接输出正文，不要额外解释。"""
+【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份；重难点写清核心方法与技巧；题型识别至少8条；易错点至少5条。直接输出正文，不要额外解释。
+【去AI味·教师口吻】用老师讲课的口吻，直接、明确、有主次；禁用套话连接词（首先/其次/此外/值得注意的是/综上所述）；禁用"不是A而是B"等强行洞察句；不写空泛形容词堆砌；结尾不强行升华；例题先说"为什么这样想"再给步骤；允许自然教学习惯语（注意/这里容易错）；去AI味绝不牺牲公式定理与步骤的准确性。"""
 
 def generate_fine_content(subject="数学", topic="函数单调性", model_choice="auto", progress_cb=None):
-    """生成单个专题的精细化内容（Markdown 文本）。分段生成以突破单次输出长度限制。
+    """生成单个专题的精细化内容（Markdown 文本）。分段生成以突破单次输出长度限制，
+    拼接时按板块编号去重，保证每个板块只出现一次。
     返回 (markdown文本, 模型显示名, 错误信息)"""
+    import re as _re
     def cb(msg):
         if progress_cb:
             progress_cb(msg)
@@ -1767,15 +1781,22 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
         if bi == 0:
             prompt = FINE_PROMPT_TEMPLATE.format(subject=subject, topic=topic, template=template_lines)
         else:
-            # 续写提示：说明已生成的前序板块，请继续后续板块
-            prev_sections = "、".join(batch for batch in FINE_TEMPLATE_SECTIONS[:bi*4])
+            # 明确本次要生成的板块编号范围
+            sec_nums = []
+            for s in batch:
+                m = _re.match(r"^(\d+)", s)
+                if m:
+                    sec_nums.append(m.group(1))
+            nums_str = "、".join(sec_nums)
+            prev_sections = "、".join(FINE_TEMPLATE_SECTIONS[:bi*4])
             prompt = (
-                f"你正在编写「{subject} · {topic}」专题的精细化精讲讲义。前面已经完成：{prev_sections}。\n"
-                f"现在请继续严格按以下板块编写（本次只输出这些板块，不要重复前序内容）：\n\n"
+                f"你正在编写「{subject} · {topic}」专题的精细化精讲讲义。"
+                f"前面已经完成编号为 {prev_sections} 的板块。\n"
+                f"现在请继续，本次【只输出】编号 {nums_str} 的以下板块（每个板块用【编号 名称】开头，不要重复前面已完成的板块）：\n\n"
                 f"{template_lines}\n\n"
                 + FINE_CONTINUE_RULES
             )
-        cb(f"[{topic}] 正在生成第 {bi+1}/{len(batches)} 批（{len(batch)} 个板块）...")
+        cb(f"[{topic}] 正在生成第 {bi+1}/{len(batches)} 批（板块 {nums_str if bi>0 else '1-4'}）...")
         try:
             resp = llm_obj.invoke(prompt)
             text = resp.content if hasattr(resp, "content") else str(resp)
@@ -1788,8 +1809,42 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
         except Exception as e:
             return "", label, f"第{bi+1}批模型调用失败：{str(e)}"
 
-    md = "\n\n".join(parts)
-    cb(f"[{topic}] 全部生成完成，共 {total} 字符")
+    # 拼接并按板块编号去重：保留每个编号第一次出现的板块内容
+    def split_sections(text):
+        """按 【n. 标题】 切分为 [(编号, 标题, 内容), ...]，非板块开头归入上一个板块"""
+        secs = []
+        cur_num, cur_title, cur_body = None, None, []
+        for line in text.split("\n"):
+            m = _re.match(r"^#*\s*【(\d+)[.、]?([^】]*)】", line)
+            if m:
+                if cur_num is not None:
+                    secs.append((cur_num, cur_title, "\n".join(cur_body).strip()))
+                cur_num = m.group(1)
+                cur_title = m.group(2).strip()
+                cur_body = []
+            else:
+                if cur_num is not None:
+                    cur_body.append(line)
+        if cur_num is not None:
+            secs.append((cur_num, cur_title, "\n".join(cur_body).strip()))
+        return secs
+
+    seen = set()
+    merged = []
+    for part in parts:
+        for num, title, body in split_sections(part):
+            if num in seen:
+                continue  # 板块已存在，跳过（去重）
+            seen.add(num)
+            merged.append(f"【{num}. {title}】\n{body}".rstrip())
+
+    # 若没有按板块切分出内容（如部分批次未用【编号】开头），则原样拼接
+    if not merged:
+        md = "\n\n".join(parts)
+    else:
+        md = "\n\n".join(merged)
+
+    cb(f"[{topic}] 全部生成完成，去重后共 {len(md)} 字符（{len(seen)} 个板块）")
     return md, label, None
 
 
