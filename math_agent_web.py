@@ -251,6 +251,7 @@ def run_batch(files, model_choice="auto"):
             acc += progress[seen] + "\n"
             seen += 1
         yield acc, None
+        time.sleep(1.0)
         time.sleep(1.5)
     while seen < len(progress):
         acc += progress[seen] + "\n"
