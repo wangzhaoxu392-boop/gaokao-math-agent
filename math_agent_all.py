@@ -1827,7 +1827,7 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
 
     # 拼接并按板块编号去重：保留每个编号第一次出现的板块内容
     def split_sections(text):
-        """按 【n. 标题】 切分为 [(编号, 标题, 内容), ...]，非板块开头归入上一个板块"""
+        """按板块标题切分为 [(编号, 标题, 内容), ...]，只认带【编号】的板块标题（防止正文行首数字干扰）"""
         secs = []
         cur_num, cur_title, cur_body = None, None, []
         for line in text.split("\n"):
@@ -1845,14 +1845,23 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
             secs.append((cur_num, cur_title, "\n".join(cur_body).strip()))
         return secs
 
-    seen = set()
+    # 合并：每批只保留本批应有的编号范围（模型可能不遵守分批），同编号取内容更长的版本
+    batch_owner = {}
+    for bi, batch in enumerate(batches):
+        allowed = set()
+        for s in batch:
+            mm = _re.match(r"^(\d+)", s)
+            if mm:
+                allowed.add(mm.group(1))
+        for num, title, body in split_sections(parts[bi]):
+            if num not in allowed:
+                continue  # 跳过不属于本批的编号
+            cand = f"【{num}. {title}】\n{body}".rstrip()
+            if num not in batch_owner or len(cand) > len(batch_owner[num]):
+                batch_owner[num] = cand
     merged = []
-    for part in parts:
-        for num, title, body in split_sections(part):
-            if num in seen:
-                continue  # 板块已存在，跳过（去重）
-            seen.add(num)
-            merged.append(f"【{num}. {title}】\n{body}".rstrip())
+    for num in sorted(batch_owner.keys(), key=lambda x: int(x)):
+        merged.append(batch_owner[num])
 
     # 若没有按板块切分出内容（如部分批次未用【编号】开头），则原样拼接
     if not merged:
@@ -1860,7 +1869,7 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
     else:
         md = "\n\n".join(merged)
 
-    cb(f"[{topic}] 全部生成完成，去重后共 {len(md)} 字符（{len(seen)} 个板块）")
+    cb(f"[{topic}] 全部生成完成，去重后共 {len(md)} 字符（{len(batch_owner)} 个板块）")
     return md, label, None
 
 
