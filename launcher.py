@@ -44,11 +44,38 @@ def kill_port_owner(port):
         pass
 
 
+def kill_stale_web_processes():
+    """清理所有残留的 math_agent_web.py 进程（含卡死/未监听/重复实例），不误杀自己。
+    防止多次启动后进程堆积导致端口竞争、服务起不来、网页打不开。"""
+    try:
+        import psutil
+        my_pid = os.getpid()
+        killed = []
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                if p.info["name"] and p.info["name"].lower().startswith("python"):
+                    cmd = " ".join(p.info["cmdline"] or [])
+                    if "math_agent_web.py" in cmd and p.info["pid"] != my_pid:
+                        # 跳过当前 launcher 自身
+                        p.kill()
+                        killed.append(p.info["pid"])
+            except Exception:
+                continue
+        if killed:
+            print(f"[清理] 已结束 {len(killed)} 个残留服务进程: {killed}")
+    except ImportError:
+        pass
+
+
 def main():
     print("=" * 46)
     print("  高考数学一体化Agent - 网页版启动（快速版）")
     print("=" * 46)
     print()
+
+    # 0. 先清理所有残留的 math_agent_web.py 进程（防止重复实例堆积）
+    kill_stale_web_processes()
+    time.sleep(1)
 
     # 1. 已在运行 → 直接打开浏览器
     if check(URL):
