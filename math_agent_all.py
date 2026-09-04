@@ -1754,8 +1754,14 @@ FINE_PROMPT_TEMPLATE = r"""你是资深{subject}教师与教研专家。请为�
 
 
 def _fine_llm(model_choice="auto"):
-    """获取精细化生成用的 LLM。auto 默认用数学/快速模型（免费优先），reasoning 用推理模型"""
-    llm_obj, label = get_llm_for_choice(model_choice, default="llm_fast")
+    """获取精细化生成用的 LLM。
+    精细化讲义要求严格按12板块长指令生成，本地小模型（qwen2.5:7b）能力不足会导致板块残缺/符号乱，
+    因此 auto 与 math 都统一走云端数学模型（DeepSeek-V3），reasoning 用推理模型。"""
+    if model_choice == "reasoning":
+        llm_obj, label = get_llm_for_choice("reasoning", default="llm")
+        return llm_obj, label
+    # auto / math 都走云端数学模型，保证生成质量
+    llm_obj, label = get_llm_for_choice("math", default="llm_math")
     return llm_obj, label
 
 
@@ -1825,53 +1831,78 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
         total += len(text)
         cb(f"[{topic}] 第 {bi+1} 批完成（{len(text)} 字符）")
 
-    # 拼接并按板块编号去重：保留每个编号第一次出现的板块内容
-    def split_sections(text):
-        """按板块标题切分为 [(编号, 标题, 内容), ...]，只认带【编号】的板块标题（防止正文行首数字干扰）"""
-        secs = []
-        cur_num, cur_title, cur_body = None, None, []
-        for line in text.split("\n"):
-            m = _re.match(r"^#*\s*【(\d+)[.、]?([^】]*)】", line)
-            if m:
-                if cur_num is not None:
-                    secs.append((cur_num, cur_title, "\n".join(cur_body).strip()))
-                cur_num = m.group(1)
-                cur_title = m.group(2).strip()
-                cur_body = []
-            else:
-                if cur_num is not None:
-                    cur_body.append(line)
-        if cur_num is not None:
-            secs.append((cur_num, cur_title, "\n".join(cur_body).strip()))
-        return secs
+    # 拼接并按模板标题锚点整理：以 FINE_TEMPLATE_SECTIONS 的标准板块标题为锚，
+    # 全文扫描每批输出，按标题关键词把内容归入对应板块（不依赖模型的编号，模型常标错号）
+    def _section_anchor(template_title):
+        """把模板标题转成匹配关键词列表（去编号、去长度说明）"""
+        t = template_title.split(". ", 1)[-1] if ". " in template_title else template_title
+        return t
 
-    # 合并：每批只保留本批应有的编号范围（模型可能不遵守分批），同编号取内容更长的版本
-    batch_owner = {}
-    for bi, batch in enumerate(batches):
-        allowed = set()
-        for s in batch:
-            mm = _re.match(r"^(\d+)", s)
-            if mm:
-                allowed.add(mm.group(1))
-        for num, title, body in split_sections(parts[bi]):
-            if num not in allowed:
-                continue  # 跳过不属于本批的编号
-            cand = f"【{num}. {title}】\n{body}".rstrip()
-            if num not in batch_owner or len(cand) > len(batch_owner[num]):
-                batch_owner[num] = cand
+    anchors = []  # [(编号, 模板标题, [关键词])]
+    for s in FINE_TEMPLATE_SECTIONS:
+        num = s.split(".")[0]
+        title = s.split(". ", 1)[-1] if ". " in s else s
+        # 关键词：取标题的核心短语（去括号说明）
+        core = title.split("（")[0].strip()
+        anchors.append((num, title, core))
+
+    def _match_section(line):
+        """匹配一行是否为某板块标题。返回 (编号, 模板标题) 或 None。
+        匹配规则：该行包含模板板块的核心关键词，且行首是数字/【/板块名。"""
+        s = line.strip().lstrip("#").strip()
+        if not s:
+            return None
+        # 规范化：去掉行首【和编号
+        s2 = _re.sub(r"^【?\s*\d+[.、．]?\s*", "", s).strip()
+        if s2.endswith("】"):
+            s2 = s2[:-1]
+        for num, title, core in anchors:
+            if not core:
+                continue
+            if core in s2:
+                return (num, title)
+            # 反向：模板核心词是长的描述，行标题可能是缩写（如“题型识别”vs“题型识别特征速查”）
+            # 当行标题较短时，判断核心词的前缀是否命中
+            if len(core) >= 4 and s2 and (s2 in core or core.startswith(s2)):
+                return (num, title)
+        return None
+
+    # 收集全文所有板块标题位置
+    section_marks = []  # (编号, 标题, 在全文中的起始偏移)
+    full_text = "\n\n".join(parts)
+    lines = full_text.split("\n")
+    for idx, line in enumerate(lines):
+        m = _match_section(line)
+        if m:
+            num, title = m
+            section_marks.append((num, title, idx))
+
+    # 按编号归档内容：从该板块标题行到下一个板块标题行之间
+    bucket = {}  # num -> {"title":..., "lines":[...]}
+    for i, (num, title, idx) in enumerate(section_marks):
+        end = section_marks[i+1][2] if i+1 < len(section_marks) else len(lines)
+        body_lines = [l for l in lines[idx:end] if l.strip()]
+        # 去掉标题行本身
+        body_lines = body_lines[1:] if body_lines else []
+        key = num
+        if key not in bucket:
+            bucket[key] = {"title": title, "lines": []}
+        # 同编号多次出现 → 拼接（保留更全内容）
+        bucket[key]["lines"].extend(body_lines)
+
     merged = []
-    for num in sorted(batch_owner.keys(), key=lambda x: int(x)):
-        merged.append(batch_owner[num])
+    for num, title, core in anchors:
+        if num in bucket and bucket[num]["lines"]:
+            body = "\n".join(bucket[num]["lines"]).strip()
+            merged.append(f"【{num}. {title}】\n{body}")
 
-    # 若没有按板块切分出内容（如部分批次未用【编号】开头），则原样拼接
     if not merged:
         md = "\n\n".join(parts)
     else:
         md = "\n\n".join(merged)
 
-    cb(f"[{topic}] 全部生成完成，去重后共 {len(md)} 字符（{len(batch_owner)} 个板块）")
+    cb(f"[{topic}] 全部生成完成，去重后共 {len(md)} 字符（{len(merged)} 个板块）")
     return md, label, None
-
 
 def _latex_to_unicode(text):
     """将残留的 LaTeX/Markdown 数学标记转换为可读的 Unicode 数学符号"""

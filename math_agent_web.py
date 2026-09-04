@@ -576,8 +576,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             fine_model = gr.Dropdown(
                 label="生成模型",
-                choices=[("自动（快速模型）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
-                value="auto", scale=2)
+                choices=[("数学模型·DeepSeek-V3（推荐，云端）", "math"), ("DeepSeek-R1 推理", "reasoning"), ("自动（云端数学）", "auto")],
+                value="math", scale=2)
             btn_fine = gr.Button("开始生成精细化讲义", variant="primary", scale=1)
         fine_log = gr.Textbox(label="生成日志", lines=14, interactive=False)
         fine_dl = gr.File(label="下载生成的 Word 讲义")
