@@ -1203,6 +1203,182 @@ def _docx_to_md(filepath: Path) -> str:
     return "\n".join(lines).strip()
 
 
+def convert_md_to_docx(md_source, output_folder=None, out_name=None):
+    """将 Markdown（文件路径或文本）转换为 Word 文档，返回 (docx路径, 提示信息)。
+    支持标题层级(#/##/###)、无序/有序列表、表格、粗体/斜体/行内代码、代码块。
+    """
+    from docx import Document
+    from docx.shared import Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+    from docx.oxml.ns import qn
+    import re as _re
+
+    if output_folder is None:
+        output_folder = Path("output_md")
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    # 读取 md 文本（支持路径或直接文本）
+    src_path = None
+    if isinstance(md_source, (str, Path)):
+        p = Path(md_source)
+        if p.exists() and p.suffix.lower() == ".md":
+            src_path = p
+    if src_path is not None:
+        with open(src_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+        if out_name is None:
+            out_name = src_path.stem + ".docx"
+    else:
+        md_text = md_source if isinstance(md_source, str) else str(md_source)
+        if out_name is None:
+            out_name = "converted.docx"
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
+    sec.top_margin = sec.bottom_margin = sec.left_margin = sec.right_margin = Cm(2.5)
+
+    def set_run_font(run, size=12, bold=False, cn="宋体", en="Arial"):
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.name = en
+        r = run._element.rPr.rFonts
+        r.set(qn("w:eastAsia"), cn)
+
+    def add_inline(p, text, size=12, bold=False, cn="宋体"):
+        """解析行内 **粗体**、*斜体*、`代码`"""
+        parts = _re.split(r"(\*\*.*?\*\*|`[^`]*`|(?<![*])\*[^*]+\*(?![*]))", text)
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith("**") and part.endswith("**"):
+                set_run_font(p.add_run(part[2:-2]), size=size, bold=True, cn=cn)
+            elif part.startswith("`") and part.endswith("`"):
+                set_run_font(p.add_run(part[1:-1]), size=size, bold=bold, cn="Courier New")
+            elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+                set_run_font(p.add_run(part[1:-1]), size=size, bold=bold, cn=cn)
+            else:
+                set_run_font(p.add_run(part), size=size, bold=bold, cn=cn)
+
+    def add_para(text, size=12, bold=False, cn="宋体", align=None, indent=0,
+                 space_before=0, space_after=0):
+        p = doc.add_paragraph()
+        if align is not None:
+            p.alignment = align
+        pf = p.paragraph_format
+        pf.space_before = Pt(space_before)
+        pf.space_after = Pt(space_after)
+        pf.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+        if indent:
+            pf.first_line_indent = Pt(indent)
+        add_inline(p, text, size=size, bold=bold, cn=cn)
+        return p
+
+    def add_table(rows):
+        """rows: list[list[str]]，第一行为表头"""
+        ncols = max(len(r) for r in rows)
+        table = doc.add_table(rows=len(rows), cols=ncols)
+        table.style = "Table Grid"
+        for ri, row in enumerate(rows):
+            for ci in range(ncols):
+                cell = table.cell(ri, ci)
+                cell.text = ""
+                txt = row[ci] if ci < len(row) else ""
+                p = cell.paragraphs[0]
+                add_inline(p, txt, size=10.5, bold=(ri == 0))
+        doc.add_paragraph()
+
+    lines = md_text.split("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i].rstrip()
+        s = raw.strip()
+
+        # 代码块
+        if s.startswith("```"):
+            i += 1
+            code_lines = []
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # 跳过结束 ```
+            p = doc.add_paragraph()
+            pf = p.paragraph_format
+            pf.space_before = Pt(2); pf.space_after = Pt(2)
+            for cl in code_lines:
+                run = p.add_run(cl + "\n")
+                run.font.size = Pt(9.5)
+                run.font.name = "Consolas"
+            continue
+
+        # 表格
+        if s.startswith("|") and i + 1 < len(lines) and "|" in lines[i+1] and set(lines[i+1].strip().replace("|", "").replace("-", "").replace(":", "").strip()) == set():
+            header = [c.strip() for c in s.strip("|").split("|")]
+            i += 2  # 跳过表头与分隔行
+            rows = [header]
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            add_table(rows)
+            continue
+
+        if not s:
+            i += 1
+            continue
+
+        # 标题
+        hm = _re.match(r"^(#{1,6})\s+(.*)$", s)
+        if hm:
+            level = len(hm.group(1))
+            text = hm.group(2).strip()
+            if level == 1:
+                add_para(text, size=18, bold=True, cn="黑体", align=WD_ALIGN_PARAGRAPH.CENTER, space_before=6, space_after=12)
+            elif level == 2:
+                add_para(text, size=15, bold=True, cn="黑体", space_before=10, space_after=6)
+            elif level == 3:
+                add_para(text, size=13, bold=True, cn="黑体", space_before=8, space_after=4)
+            else:
+                add_para(text, size=12, bold=True, space_before=6, space_after=2)
+            i += 1
+            continue
+
+        # 无序列表
+        lm = _re.match(r"^([-*•])\s+(.*)$", s)
+        if lm:
+            add_para("• " + lm.group(2).strip(), size=12, indent=12, space_after=2)
+            i += 1
+            continue
+
+        # 有序列表
+        om = _re.match(r"^(\d+)[.、)]\s+(.*)$", s)
+        if om:
+            add_para(om.group(1) + ". " + om.group(2).strip(), size=12, indent=12, space_after=2)
+            i += 1
+            continue
+
+        # 引用
+        if s.startswith(">"):
+            add_para(s.lstrip("> ").strip(), size=12, cn="楷体", indent=12, space_after=2)
+            i += 1
+            continue
+
+        # 分隔线
+        if _re.match(r"^[-*_]{3,}$", s):
+            add_para("─" * 30, size=10, space_before=2, space_after=2)
+            i += 1
+            continue
+
+        # 普通段落
+        indent = 24 if len(s) > 0 and not s.startswith(("（", "(", "•", "①")) else 0
+        add_para(s, size=12, indent=indent, space_after=2)
+        i += 1
+
+    out_path = output_folder / out_name
+    doc.save(str(out_path))
+    return str(out_path), f"已生成 {out_path.name}（{len(md_text)} 字符，{len(lines)} 行）"
+
+
 def convert_file_to_md(filepath, output_folder=None):
     """将文件转换为Markdown，返回(md文本, md文件路径)。
     支持 pdf / docx / txt / md。"""
@@ -1701,18 +1877,18 @@ FINE_TOPICS = {
 
 # 12 项精细化模板的固定结构（学科无关，供 LLM 生成时遵循）
 FINE_TEMPLATE_SECTIONS = [
-    "1. 核心概念与定义",
-    "2. 必背公式/定理/定律（含常见变形与重要结论）",
-    "3. 基本性质与规律",
-    "4. A级基础题型（概念辨析、直接计算，2~3题，含完整题面与解析）",
-    "5. B级常见题型（标准方法，4~5题，含完整题面与解析，覆盖本专题核心方法）",
-    "6. C级综合题型（多知识点结合，3~4题，含完整题面与解析）",
-    "7. D级拔高题型（以历年高考/会考真题题型为主，3~4题，含完整题面与解析，注明考法）",
-    "8. 题型识别特征速查（看到XX→用XX，8条以上）",
-    "9. 标准解题方法总流程",
-    "10. 典型易错点诊断（5条以上）",
-    "11. 重难点突破（含核心方法与技巧）",
-    "12. 高考/会考真题映射与跨学科迁移",
+    "1. 核心概念与定义（只写定义，不写公式）",
+    "2. 必背公式/定理/定律（按类全量罗列，本专题至少8条，每条含名称/公式/适用条件或易错提醒；含严谨的秒杀结论小节）",
+    "3. 基本性质与规律（分专题全面罗列，本专题至少6条，每条含表述+证明思路或典型用法）",
+    "4. A级基础题型（本板块先列方法总览，再各方法配1~2道基础题，含完整题面与解析）",
+    "5. B级常见题型（总：先列本板块覆盖的核心方法；分：每个方法给要点+按基础/中档难度递进的2~3道题，共4~5题，含完整题面与解析）",
+    "6. C级综合题型（多方法综合运用，3~4题，含完整题面与解析）",
+    "7. D级拔高题型（以历年高考/会考真题题型为主，3~4题，含完整题面与解析，注明考法与年份）",
+    "8. 题型识别特征速查（统一写成“看到【具体特征】→【首选方法】”，按递推/求和/证明/综合分类，至少10条，特征必须具体可判断）",
+    "9. 标准解题方法总流程（分步骤编号，含示例）",
+    "10. 典型易错点诊断（至少5条，每条用【易错点】【典型错误】【正确做法】三段式，结合本专题具体题目）",
+    "11. 重难点突破（聚焦本专题2~3个真正难啃的核心方法，每个含：适用类型→标准步骤→完整例题→常见卡点提醒）",
+    "12. 高考/会考真题映射与跨学科迁移（真题给完整解析与答案）",
 ]
 
 FINE_PROMPT_TEMPLATE = r"""你是资深{subject}教师与教研专家。请为「{subject} · {topic}」专题编写一份完整、详实的精细化精讲讲义，严格按以下 12 个板块组织：
@@ -1730,15 +1906,21 @@ FINE_PROMPT_TEMPLATE = r"""你是资深{subject}教师与教研专家。请为�
    - 特殊符号直接写：π、±、∞、∈、⊆、∩、∪、⇒、⇔、∑、√、Δ。
 2. 写出的文本必须能直接阅读，不要留下任何 LaTeX 代码。
 
+【板块细化要求 - 必须严格遵守】
+1. 【必背公式/定理/定律】：按类全量罗列本专题全部核心公式，本专题至少 8 条；每条格式为“【名称】公式（适用条件或易错提醒）”；不得与板块1核心概念重复（板块1只写定义，这里只写公式）；可在末尾设“秒杀结论”小节，只保留严格可证、有普适性的结论并标注适用条件，给不出严谨结论的宁可不写，禁止写近似或只在特殊情形成立的结论。
+2. 【基本性质与规律】：按“等差类/等比类/通用类（含前n项和Sn与an关系、最值、周期性、奇偶项、倒序相加等）”分类罗列，本专题至少 6 条；每条给“表述 + 证明思路或典型用法”。
+3. 【题型板块（4~7）】内部统一按“总—分—难度”路线组织：先列本板块覆盖的方法总览（总），再对每个方法给“方法要点1~2句 + 例题（按基础→中档→综合难度递进）”（分）。各题型板块之间不重叠：A级只放最基础方法，B级放核心方法并逐一展开，C级放多方法综合，D级放高考真题综合。同一道题不要重复出现在不同板块。
+4. 【题型识别特征速查】：每条统一写成“看到【具体特征】→【首选方法】，例如：…”；按“递推类/求和类/证明类/综合类”分组，至少 10 条；特征必须具体可判断（禁止“出现等差等比字眼”这类空泛表述）。
+5. 【典型易错点诊断】：至少 5 条，每条固定三段式——【易错点】…【典型错误】…（含一段错误示范与错误结论）【正确做法】…（含正确结论）；每条必须结合本专题具体题目展开。
+6. 【重难点突破】：只聚焦本专题 2~3 个真正难啃的核心方法，不贪多；每个方法固定四步——适用类型、标准步骤（编号）、完整例题（含思路+分步解析+最终答案）、常见卡点提醒；禁止重复出现同名方法、禁止编号混乱。
+7. 【真题部分（D级与板块12）】：所有真题/改编题必须给出完整分步解析与最终答案。硬性红线：禁止出现“证明略”“易证”“显然”“同理”等省略性表述，每道题都要完整写出过程。
+
 【内容要求】
 1. 内容准确、专业，面向高中{subject}复习与备考场景；
 2. 题型部分每道题都必须给出【完整题面 + 分步解析 + 最终答案】，中档题（B/C级）要具体详细；
 3. 拔高题（D级）以历年高考/会考真题题型为主，题目标注考法与年份（如“2023全国卷”），并给出贴近高考难度的完整解析；
-4. 【必背公式/定理】板块必须补充本专题的重要变形、常见结论、推论与“秒杀结论”，例如基本不等式要包含：1的代换、凑定值、等号成立条件、调和≤几何≤算术≤平方不等式链、a²+b²≥2ab、ab≤((a+b)/2)²等；
-5. 【重难点突破】必须写清本专题的核心方法与技巧（如基本不等式的“1的代换/常数代换、拆项、凑定值、换元、放缩”等），并配1~2个典型例子说明；
-6. 【题型识别特征】至少8条；【典型易错点】至少5条；
-7. 每个板块用「【板块名】」开头，直接输出正文，不要额外解释；
-8. 总字数 6000~9000 字，保证内容丰富、可直接用于备课或学生复习。
+4. 每个板块用「【板块名】」开头，直接输出正文，不要额外解释；
+5. 总字数 6000~9000 字，保证内容丰富、可直接用于备课或学生复习。
 
 【去AI味·教师口吻 - 非常重要，必须严格遵守】
 1. 你是给真实高中生备课的老师，不是写报告的机器人。讲解要有老师讲课的口吻：直接、明确、有主次，像"这个考点常考，务必注意"这样的提醒；
@@ -1765,8 +1947,9 @@ def _fine_llm(model_choice="auto"):
     return llm_obj, label
 
 
-FINE_CONTINUE_RULES = """【数学符号书写规则】一律使用 Unicode 纯文本数学符号，禁止使用 LaTeX/Markdown 数学标记（不要出现 \\( \\)、\\[ \\]、\\frac、\\sqrt、\\geq、\\cdot、^、_、花括号等命令）；分数线用斜杠如 (a+b)/2；开方用 √；不等式用 ≥、≤、≠；乘号用 ×；上下标用 a²、b₁、aⁿ、f'(x)。写出的文本必须能直接阅读。
-【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份；重难点写清核心方法与技巧；题型识别至少8条；易错点至少5条。直接输出正文，不要额外解释。【字数要求 - 必须遵守】你本次负责的 4 个板块合计至少 2000 字，题型板块（含题目与解析）务必展开写满，宁可详实不可简略；每个板块都要有实质内容，禁止只用一行带过。
+FINE_CONTINUE_RULES = r"""【数学符号书写规则】一律使用 Unicode 纯文本数学符号，禁止使用 LaTeX/Markdown 数学标记（不要出现 \( \)、\[ \]、\frac、\sqrt、\geq、\cdot、^、_、花括号等命令）；分数线用斜杠如 (a+b)/2；开方用 √；不等式用 ≥、≤、≠；乘号用 ×；上下标用 a²、b₁、aⁿ、f'(x)。写出的文本必须能直接阅读。
+【板块细化要求】必背公式按类全量罗列至少8条（每条含名称/公式/适用条件），秒杀结论只写严谨可证并标适用条件；基本性质分专题至少6条（每条含表述+用法）；题型板块内部按“方法总览→各方法要点+按难度例题”组织；题型识别写成“看到【特征】→【方法】”并按递推/求和/证明/综合分类至少10条；易错点每条用【易错点】【典型错误】【正确做法】三段式至少5条；重难点只聚焦2~3个核心方法（适用类型→标准步骤→完整例题→卡点提醒）。【硬性红线】禁止出现“证明略”“易证”“显然”等省略性表述，任何题目都要完整写出过程与答案。
+【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份。直接输出正文，不要额外解释。【字数要求 - 必须遵守】你本次负责的 4 个板块合计至少 2000 字，题型板块（含题目与解析）务必展开写满，宁可详实不可简略；每个板块都要有实质内容，禁止只用一行带过。
 【去AI味·教师口吻】用老师讲课的口吻，直接、明确、有主次；禁用套话连接词（首先/其次/此外/值得注意的是/综上所述）；禁用"不是A而是B"等强行洞察句；不写空泛形容词堆砌；结尾不强行升华；例题先说"为什么这样想"再给步骤；允许自然教学习惯语（注意/这里容易错）；去AI味绝不牺牲公式定理与步骤的准确性。"""
 
 def generate_fine_content(subject="数学", topic="函数单调性", model_choice="auto", progress_cb=None):
@@ -1848,7 +2031,8 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
 
     def _match_section(line):
         """匹配一行是否为某板块标题。返回 (编号, 模板标题) 或 None。
-        匹配规则：该行包含模板板块的核心关键词，且行首是数字/【/板块名。"""
+        匹配规则：该行包含模板板块的核心关键词，且行首是数字/【/板块名。
+        支持等级字母回退（A级→4/B级→5/C级→6/D级→7），兼容模型措辞变化。"""
         s = line.strip().lstrip("#").strip()
         if not s:
             return None
@@ -1865,30 +2049,51 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
             # 当行标题较短时，判断核心词的前缀是否命中
             if len(core) >= 4 and s2 and (s2 in core or core.startswith(s2)):
                 return (num, title)
+        # 等级字母回退：A级→4、B级→5、C级→6、D级→7（模型可能写成"B级核心题型"而非模板措辞）
+        # 仅当以字母+级开头且为短标题行（不含正文标点特征）时启用，避免误判正文
+        if _re.match(r"^[A-Da-d]级", s2) and len(s2) <= 16 and not _re.search(r"[：:。；，]", s2):
+            grade_map = {"A": "4", "a": "4", "B": "5", "b": "5", "C": "6", "c": "6", "D": "7", "d": "7"}
+            for anchor_num, anchor_title, anchor_core in anchors:
+                if anchor_num == grade_map[s2[0]]:
+                    return (anchor_num, anchor_title)
         return None
 
-    # 收集全文所有板块标题位置
-    section_marks = []  # (编号, 标题, 在全文中的起始偏移)
-    full_text = "\n\n".join(parts)
-    lines = full_text.split("\n")
-    for idx, line in enumerate(lines):
-        m = _match_section(line)
-        if m:
-            num, title = m
-            section_marks.append((num, title, idx))
+    # 每批应有的板块编号范围（用于防止模型跨批重复输出同一板块）
+    batch_allowed = []
+    for batch in batches:
+        allowed = set()
+        for s in batch:
+            mm = _re.match(r"^(\d+)", s)
+            if mm:
+                allowed.add(mm.group(1))
+        batch_allowed.append(allowed)
 
-    # 按编号归档内容：从该板块标题行到下一个板块标题行之间
-    bucket = {}  # num -> {"title":..., "lines":[...]}
-    for i, (num, title, idx) in enumerate(section_marks):
-        end = section_marks[i+1][2] if i+1 < len(section_marks) else len(lines)
-        body_lines = [l for l in lines[idx:end] if l.strip()]
-        # 去掉标题行本身
-        body_lines = body_lines[1:] if body_lines else []
-        key = num
-        if key not in bucket:
-            bucket[key] = {"title": title, "lines": []}
-        # 同编号多次出现 → 拼接（保留更全内容）
-        bucket[key]["lines"].extend(body_lines)
+    # 逐批归档：每板块只从"所属批次"取内容（所属批次没生成时才用跨批暂存补漏）
+    bucket = {}   # num -> {"title":..., "lines":[...]}，正式归档
+    stray = {}    # num -> {"title":..., "lines":[...]}，跨批误带暂存
+    for bi, part in enumerate(parts):
+        allowed = batch_allowed[bi]
+        plines = part.split("\n")
+        marks = []
+        for idx, line in enumerate(plines):
+            m = _match_section(line)
+            if m:
+                marks.append((m[0], m[1], idx))
+        for i, (num, title, idx) in enumerate(marks):
+            end = marks[i+1][2] if i+1 < len(marks) else len(plines)
+            body_lines = [l for l in plines[idx:end] if l.strip()]
+            body_lines = body_lines[1:] if body_lines else []
+            # 过滤掉混在正文里的重复板块标题行
+            body_lines = [l for l in body_lines if _match_section(l) is None]
+            target = bucket if num in allowed else stray
+            if num not in target:
+                target[num] = {"title": title, "lines": []}
+            target[num]["lines"].extend(body_lines)
+
+    # 补漏：所属批次没生成该板块时，用跨批暂存的内容
+    for num in [str(i) for i in range(1, 13)]:
+        if num not in bucket and num in stray:
+            bucket[num] = stray[num]
 
     merged = []
     for num, title, core in anchors:

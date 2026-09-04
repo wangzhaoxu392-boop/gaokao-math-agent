@@ -354,6 +354,19 @@ def convert_to_md_ui(file_obj):
         return f"❌ 转换失败：{type(e).__name__}: {str(e)[:300]}", None
 
 
+# ==================== 功能5辅助：MD转Word ====================
+def convert_md_to_docx_ui(file_obj):
+    if file_obj is None:
+        return "请先上传 MD 文件。", None
+    try:
+        fpath = Path(file_obj.name) if hasattr(file_obj, "name") else Path(str(file_obj))
+        out_path, msg = maa.convert_md_to_docx(fpath)
+        preview = f"✅ {msg}\n\n路径：{out_path}"
+        return preview, out_path
+    except Exception as e:
+        return f"❌ 转换失败：{type(e).__name__}: {str(e)}", None
+
+
 # ==================== 功能6：精细化内容生成 ====================
 def fine_subjects():
     """返回学科列表"""
@@ -542,24 +555,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         btn_research.click(run_research, inputs=[exam_file, research_model],
                            outputs=[exam_log, exam_dl])
 
-    # ---------- 功能5：文件转MD ----------
-    with gr.Tab("⑤ 文件转MD"):
-        gr.Markdown("""
-**将 DOCX / PDF / TXT 文件转换为 Markdown 格式**，公式保留为 LaTeX，方便编辑和导入知识库。
-- **PDF**：使用 pymupdf4llm，公式/表格/排版保留好
-- **DOCX**：基于 python-docx，保留标题/段落/表格结构
-- **TXT**：直接转为 MD
-转换后的文件保存在 `output_md/` 文件夹。
-""")
-        md_upload = gr.File(label="上传文件（docx/pdf/txt，单个文件）", file_count="single")
-        btn_md_convert = gr.Button("转换为 MD", variant="primary")
-        md_preview = gr.Textbox(label="MD 内容预览", lines=22, interactive=False)
-        md_dl = gr.File(label="下载 MD 文件")
-        btn_md_convert.click(convert_to_md_ui, inputs=[md_upload],
-                              outputs=[md_preview, md_dl])
-
-    # ---------- 功能6：精细化内容生成 ----------
-    with gr.Tab("⑥ 精细化内容生成"):
+    # ---------- 功能5：精细化内容生成 ----------
+    with gr.Tab("⑤ 精细化内容生成"):
         gr.Markdown("""
 **按「学科通用精细化模板」（12板块）自动生成专题精讲讲义，可复用于数学/物理/化学等学科。**
 - 选择学科 → 篇章 → 专题，点击生成后由 LLM 按模板编写，自动导出 Word 文档（含核心概念、公式、ABCD四级题型与解析、易错点、重难点、真题映射）。
@@ -585,6 +582,31 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         fine_category.change(_fine_update_topics, inputs=[fine_subject, fine_category], outputs=[fine_topic])
         btn_fine.click(run_fine, inputs=[fine_subject, fine_category, fine_topic, fine_model],
                        outputs=[fine_log, fine_dl])
+
+    # ---------- 功能6：文件格式转换（MD↔Word 双向） ----------
+    with gr.Tab("⑥ 文件格式转换"):
+        gr.Markdown("""
+**文件格式互转：DOCX / PDF / TXT → Markdown，以及 Markdown → Word**
+- **① 转 MD**：上传 docx / pdf / txt → 输出 Markdown（保存在 `output_md/`）
+- **② 转 Word**：上传 .md 文件 → 输出 Word 文档（保存在 `output_md/`）
+""")
+        with gr.Group():
+            gr.Markdown("**① 转 MD（docx / pdf / txt → Markdown）**")
+            md_upload = gr.File(label="上传文件（docx/pdf/txt，单个文件）", file_count="single")
+            btn_md_convert = gr.Button("转换为 MD", variant="primary")
+            md_preview = gr.Textbox(label="MD 内容预览", lines=12, interactive=False)
+            md_dl = gr.File(label="下载 MD 文件")
+        with gr.Group():
+            gr.Markdown("**② 转 Word（Markdown → docx）**")
+            docx_upload = gr.File(label="上传 .md 文件（单个文件）", file_count="single")
+            btn_docx_convert = gr.Button("转换为 Word", variant="primary")
+            docx_preview = gr.Textbox(label="转换结果", lines=3, interactive=False)
+            docx_dl = gr.File(label="下载 Word 文件")
+        btn_md_convert.click(convert_to_md_ui, inputs=[md_upload],
+                              outputs=[md_preview, md_dl])
+        btn_docx_convert.click(convert_md_to_docx_ui, inputs=[docx_upload],
+                              outputs=[docx_preview, docx_dl])
+
 
 if __name__ == "__main__":
     # 并发设为 1，避免与本地 Ollama 单实例推理冲突
