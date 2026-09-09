@@ -73,21 +73,28 @@ def main():
     print("=" * 46)
     print()
 
-    # 0. 先清理所有残留的 math_agent_web.py 进程（防止重复实例堆积）
-    kill_stale_web_processes()
-    time.sleep(1)
-
-    # 1. 已在运行 → 直接打开浏览器
+    # 1. 服务已在运行 → 直接打开浏览器（不清理不重启，秒开）
     if check(URL):
         print("[OK] 网页服务已在运行，正在打开浏览器...")
         webbrowser.open(URL)
+        print()
+        print("=" * 46)
+        print("  网页版地址：http://127.0.0.1:7860")
+        print("  如浏览器未自动弹出，请复制上面地址手动打开")
+        print("  3 秒后本窗口自动关闭")
+        print("=" * 46)
+        time.sleep(3)
         return 0
 
-    # 2. 精确清理占用 7860 端口的残留进程
+    # 2. 服务未运行 → 先清理残留的 math_agent_web.py 进程（防止重复实例堆积）
+    kill_stale_web_processes()
+    time.sleep(1)
+
+    # 3. 精确清理占用 7860 端口的残留进程
     kill_port_owner(PORT)
     time.sleep(1)
 
-    # 3. 启动网页服务（新窗口）
+    # 4. 启动网页服务（新窗口）
     print("[启动] 正在启动网页服务（首次加载约5-15秒）...")
     try:
         subprocess.Popen(
@@ -96,9 +103,12 @@ def main():
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
     except Exception as e:
         print(f"[错误] 启动失败: {e}")
+        print(f"  请手动运行: {PYTHON} -X utf8 {WEB_PY}")
+        print("  5 秒后本窗口自动关闭")
+        time.sleep(5)
         return 1
 
-    # 4. 快速轮询等待就绪
+    # 5. 快速轮询等待就绪
     print("[等待] 等待服务就绪...")
     n = 0
     while n < 60:
@@ -106,11 +116,25 @@ def main():
         if check(URL, timeout=1):
             print("[OK] 网页服务已就绪，正在打开浏览器！")
             webbrowser.open(URL)
+            print()
+            print("=" * 46)
+            print("  网页版地址：http://127.0.0.1:7860")
+            print("  如浏览器未自动弹出，请复制上面地址手动打开")
+            print("  3 秒后本窗口自动关闭")
+            print("=" * 46)
+            time.sleep(3)
             return 0
         time.sleep(1)
 
     print("[提示] 服务启动较慢，请手动访问 " + URL)
     webbrowser.open(URL)
+    print()
+    print("=" * 46)
+    print("  网页版地址：http://127.0.0.1:7860")
+    print("  如浏览器未自动弹出，请复制上面地址手动打开")
+    print("  5 秒后本窗口自动关闭")
+    print("=" * 46)
+    time.sleep(5)
     return 0
 
 
