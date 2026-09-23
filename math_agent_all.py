@@ -6,15 +6,13 @@ import time
 import sqlite3
 import requests
 from pathlib import Path
-import matplotlib.pyplot as plt
 import sympy
-from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_ollama import ChatOllama
 from langgraph.graph import MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langchain_chroma import Chroma
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
@@ -22,7 +20,6 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 import pymupdf as fitz  # PyMuPDF，PDF文本提取+OCR
 from docx import Document
 
-plt.switch_backend('Agg')
 load_dotenv()
 
 # ========================全局路径配置========================
@@ -63,29 +60,46 @@ llm_fast = ChatOllama(
 
 # 数学专用模型：支持本地 Ollama（免费）或硅基流动 API（免费额度内，72B数学模型更准）
 # .env 配置：MATH_PROVIDER=ollama 或 siliconflow；MATH_MODEL=模型名
+# 【启动提速】延迟创建：首次使用数学模型时才导入 langchain_openai（该库导入约1秒），加快网页版启动
 _MATH_PROVIDER = os.getenv("MATH_PROVIDER", "ollama").lower()
 _MATH_MODEL_NAME = os.getenv("MATH_MODEL", "qwen2.5:14b")
+llm_math = None
+llm_math_with_tools = None
 
-if _MATH_PROVIDER == "siliconflow":
-    from langchain_openai import ChatOpenAI
-    llm_math = ChatOpenAI(
-        model=_MATH_MODEL_NAME,
-        api_key=os.getenv("SILICONFLOW_API_KEY", ""),
-        base_url="https://api.siliconflow.cn/v1",
-        temperature=0.1,
-        max_tokens=3072,
-        timeout=120
-    )
-    print(f"[模型] 数学模型使用硅基流动 API: {_MATH_MODEL_NAME}")
-else:
-    llm_math = ChatOllama(
-        base_url=os.getenv("OLLAMA_BASE_URL"),
-        model=_MATH_MODEL_NAME,
-        temperature=0.1,
-        num_predict=3072,
-        timeout=900
-    )
-    print(f"[模型] 数学模型使用本地 Ollama: {_MATH_MODEL_NAME}")
+
+def _ensure_llm_math():
+    """延迟创建数学模型（首次调用才创建并导入对应库）"""
+    global llm_math
+    if llm_math is None:
+        if _MATH_PROVIDER == "siliconflow":
+            from langchain_openai import ChatOpenAI
+            llm_math = ChatOpenAI(
+                model=_MATH_MODEL_NAME,
+                api_key=os.getenv("SILICONFLOW_API_KEY", ""),
+                base_url="https://api.siliconflow.cn/v1",
+                temperature=0.1,
+                max_tokens=3072,
+                timeout=120
+            )
+            print(f"[模型] 数学模型使用硅基流动 API: {_MATH_MODEL_NAME}")
+        else:
+            llm_math = ChatOllama(
+                base_url=os.getenv("OLLAMA_BASE_URL"),
+                model=_MATH_MODEL_NAME,
+                temperature=0.1,
+                num_predict=3072,
+                timeout=900
+            )
+            print(f"[模型] 数学模型使用本地 Ollama: {_MATH_MODEL_NAME}")
+    return llm_math
+
+
+def _ensure_llm_math_with_tools():
+    """延迟创建带工具绑定的数学模型（tools 在模块中定义后调用）"""
+    global llm_math_with_tools
+    if llm_math_with_tools is None:
+        llm_math_with_tools = _ensure_llm_math().bind_tools(tools)
+    return llm_math_with_tools
 
 CATEGORY_LIST = ["集合", "函数", "导数", "三角", "数列", "立体几何", "圆锥曲线", "概率统计"]
 
@@ -215,9 +229,11 @@ def sympy_math_calc(code: str) -> str:
 @tool
 def plot_function(expr_str: str, x_range: tuple = (-10, 10)) -> str:
     """绘制函数图像，保存图片到output文件夹"""
+    import matplotlib.pyplot as plt
+    plt.switch_backend('Agg')
     x = sympy.Symbol('x')
     expr = sympy.parse_expr(expr_str)
-    f_lambda = sympy.lambdify(x, expr, "matplotlib")
+    f_lambda = sympy.lambdify(x, expr, "numpy")
     import numpy as np
     xs = np.linspace(x_range[0], x_range[1], 500)
     ys = f_lambda(xs)
@@ -232,7 +248,6 @@ def plot_function(expr_str: str, x_range: tuple = (-10, 10)) -> str:
 
 tools = [sympy_math_calc, plot_function]
 llm_with_tools = llm.bind_tools(tools)
-llm_math_with_tools = llm_math.bind_tools(tools)
 
 # ======================== 模型路由：按题型自动选择推理模型 / 数学模型 ========================
 _REASONING_KEYWORDS = re.compile(
@@ -253,12 +268,12 @@ def resolve_model(choice: str, question: str):
     if choice == "reasoning":
         return llm_with_tools, llm, "DeepSeek-R1（推理模型）"
     if choice == "math":
-        return llm_math_with_tools, llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}）"
+        return _ensure_llm_math_with_tools(), _ensure_llm_math(), f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}）"
     # auto
     routed = route_model(question)
     if routed == "reasoning":
         return llm_with_tools, llm, "DeepSeek-R1（推理模型·自动）"
-    return llm_math_with_tools, llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
+    return _ensure_llm_math_with_tools(), _ensure_llm_math(), f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
 
 def get_llm_for_choice(choice: str, default: str = "llm"):
     """根据 model_choice 返回 (LLM实例, 显示名)，用于直接调用 .invoke() 的场景（非图模式）。
@@ -267,12 +282,12 @@ def get_llm_for_choice(choice: str, default: str = "llm"):
     if choice == "reasoning":
         return llm, "DeepSeek-R1（推理模型）"
     if choice == "math":
-        return llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}）"
+        return _ensure_llm_math(), f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}）"
     # auto
     if default == "llm_fast":
         return llm_fast, "Qwen2.5-7B（快速模型·自动）"
     if default == "llm_math":
-        return llm_math, f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
+        return _ensure_llm_math(), f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
     return llm, "DeepSeek-R1（推理模型·自动）"
 
 # ========================B RAG知识库模块【升级支持pdf、docx】========================
@@ -311,14 +326,19 @@ def build_rag_vector_db():
         print("knowledge_docs文件夹没有有效文档，跳过构建向量库")
         return None
     full_doc = "\n".join(all_text)
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
     splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
     chunks = splitter.split_text(full_doc)
+    from langchain_ollama import OllamaEmbeddings
+    from langchain_chroma import Chroma
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
     db = Chroma.from_texts(chunks, embedding=embeddings, persist_directory=CHROMA_DB_PATH)
     print("✅RAG向量知识库构建完成，支持格式：txt/md/docx/pdf")
     return db
 
 def load_rag_db():
+    from langchain_ollama import OllamaEmbeddings
+    from langchain_chroma import Chroma
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
     if os.path.exists(CHROMA_DB_PATH) and len(os.listdir(CHROMA_DB_PATH)) > 0:
         db = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embeddings)
@@ -519,6 +539,8 @@ def _index_wiki_db():
         metas.append(str(p))
     if not texts:
         return None
+    from langchain_ollama import OllamaEmbeddings
+    from langchain_chroma import Chroma
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
     db = Chroma.from_texts(texts, embedding=embeddings,
                            metadatas=[{"page": m} for m in metas],
@@ -570,6 +592,8 @@ def wiki_retrieve(query: str, k: int = 3):
         # 2) 关键词命中不足时，用向量检索补充
         if len(top) < k:
             try:
+                from langchain_ollama import OllamaEmbeddings
+                from langchain_chroma import Chroma
                 embeddings = OllamaEmbeddings(model="nomic-embed-text")
                 if os.path.exists(WIKI_DB_PATH) and len(os.listdir(WIKI_DB_PATH)) > 0:
                     db = Chroma(persist_directory=WIKI_DB_PATH, embedding_function=embeddings)
