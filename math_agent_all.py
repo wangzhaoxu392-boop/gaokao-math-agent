@@ -2413,3 +2413,134 @@ if __name__ == "__main__":
             research_workflow()
         else:
             print("无效输入，请重新选择")
+
+
+# ================= 题目档案与命题人变式（功能⑦） =================
+
+QUESTION_ARCHIVE_PROMPT = """你是高考数学命题研究与教学专家。请对下面这道题建立完整的「题目档案」，严格按以下 11 个字段输出，每个字段都要具体、可操作、言之有物，禁止空话套话：
+
+【1 原题】完整题面
+【2 考查知识点】精确到二级知识点（如"导数与函数单调性""含参分类讨论""零点存在定理"），列出 2~4 个
+【3 教材原型】对应人教A版教材的章节/例题/习题出处（如"必修第一册 第4章 指数函数与对数函数 例5"）；若是高考改编题，写"原型为 XX 年 XX 卷 XX 题 + 教材 XX"
+【4 解题入口】第一入口（最直接可下手的操作，如"构造函数 F(x)=f(x)-g(x) 研究零点"）+ 第二入口（备用思路，如"参变分离画图"），各一句话，必须具体到可执行
+【5 标准解法】分步完整写出，含关键计算过程与最终结论，可检验
+【6 第二解法】与标准解法不同的路径（换元/数形结合/参变分离/特殊化/对称性等），简明但完整
+【7 关键转折点】解这道题最核心的思维跳跃，一句话说透（如"把证明存在性转化为研究函数最值"）
+【8 易错点】2~3 个，具体到位置与后果（如"分类讨论遗漏端点 a=0""未验证取等条件"）
+【9 题型识别】给出"题型家族"名（如"含参函数零点/极值综合"）+ 3~4 个识别特征（看到什么关键词/结构就知道属于这个题型）
+【10 可迁移方法】本题方法可套用到哪类题（如"构造函数差值法→不等式证明""参变分离→恒成立求参"），列出 2~3 条
+【11 变式方向】2~3 个变式方向，每个给一句话（如"改变参数位置→f(x)=x³-3x²+ax+b 型""改变零点个数→已知有三个极值点求 a""改变证明目标→证明恒成立"）
+
+【硬性红线】标准解法与第二解法必须完整可检验，禁止出现"略""易证""显然""同理""过程略""解答略"等省略表述；宁长勿短。
+【符号规则】数学符号用 Unicode 纯文本（分数用斜杠 (a+b)/2、开方用 √、上下标用 a²、x₁、f'(x)），禁止 LaTeX 命令。
+直接输出题目档案正文，不要额外解释。题目如下：
+
+{question}"""
+
+PROPOSER_VARIANT_PROMPT = """你是高考数学命题人。请以"命题人视角"对下面这道题做改造研究，输出以下内容：
+
+【一、命题基因拆解】把本题拆成可替换的"部件"（函数结构/参数位置/问题目标/条件约束/数值设置），每个部件列出 2~3 种改法，说明改动的效果。
+【二、变式生成】给出 4 个完整变式（每个变式 = 完整可做题面 + 命题意图一句话）：
+- 变式1：改变参数位置或函数结构（如 f(x)=x³-3x²+ax → f(x)=x³-3x²+ax+b，或加指数/对数项）
+- 变式2：改变问题目标（如由"讨论单调性与极值"改为"已知有两个极值点求参数范围""已知在某区间单调递增求参数范围""证明零点个数"等）
+- 变式3：改变条件约束（区间变化/定义域限制/附加不等式/端点值给定）
+- 变式4：数值特例化或一般化（具体系数换成字母，或相反）
+【三、题型生成机制】说明这一类题命题人沿哪条"改造链"出题（结构→目标→条件→数据），用 3~5 步链条写明，让读者看到"一道题是如何变成一族题"的。
+【四、备考启示】学生掌握哪 1~2 个"以不变应万变"的核心方法即可覆盖这一族变式，写清楚。
+
+【硬性红线】每个变式必须是完整可做的题目（含具体函数与完整设问），禁止只写方向不写题目；禁止出现"略""易证"等省略表述。
+【符号规则】数学符号用 Unicode 纯文本（(a+b)/2、√、a²、x₁、f'(x)），禁止 LaTeX 命令。
+直接输出研究结果正文，不要额外解释。题目如下：
+
+{question}"""
+
+
+def _archive_llm(model_choice="math"):
+    """题目档案/变式生成统一走云端数学模型（质量优先），reasoning 可选推理模型"""
+    llm_obj, label = _fine_llm(model_choice)
+    return llm_obj, label
+
+
+def generate_question_archive(question: str, model_choice: str = "math", progress_cb=None):
+    """题目档案：对一道题输出 11 字段结构化档案。返回 (文本, 模型名, 错误信息)"""
+    def cb(msg):
+        if progress_cb:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+        print(msg)
+    if not question or len(question.strip()) < 8:
+        return "", "", "题目过短，无法分析"
+    llm_obj, label = _archive_llm(model_choice)
+    prompt = QUESTION_ARCHIVE_PROMPT.format(question=question.strip())
+    cb(f"[题目档案] 调用 {label} 分析中...")
+    for attempt in range(2):
+        try:
+            resp = llm_obj.invoke(prompt)
+            text = resp.content if hasattr(resp, "content") else str(resp)
+            text = text.strip()
+            if not text:
+                return "", label, "模型返回为空"
+            if len(text) < 300 and attempt == 0:
+                cb(f"[题目档案] 输出过短({len(text)}字)，重新生成...")
+                prompt = prompt + "\n\n【注意】你上一次输出太简略，请把 11 个字段全部写充实，标准解法与第二解法完整可检验，本次至少 800 字。"
+                continue
+            if "siliconflow" in label.lower():
+                record_api_usage()
+            return text, label, ""
+        except Exception as e:
+            if attempt == 0:
+                cb(f"[题目档案] 调用出错，重试一次：{str(e)[:80]}")
+            else:
+                return "", label, f"调用失败：{str(e)[:150]}"
+    return "", label, "连续两次调用失败"
+
+
+def generate_proposer_variants(question: str, model_choice: str = "math", progress_cb=None):
+    """命题人视角改造：对一道题生成变式族 + 题型生成机制。返回 (文本, 模型名, 错误信息)"""
+    def cb(msg):
+        if progress_cb:
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+        print(msg)
+    if not question or len(question.strip()) < 8:
+        return "", "", "题目过短，无法分析"
+    llm_obj, label = _archive_llm(model_choice)
+    prompt = PROPOSER_VARIANT_PROMPT.format(question=question.strip())
+    cb(f"[命题人改造] 调用 {label} 研究中...")
+    for attempt in range(2):
+        try:
+            resp = llm_obj.invoke(prompt)
+            text = resp.content if hasattr(resp, "content") else str(resp)
+            text = text.strip()
+            if not text:
+                return "", label, "模型返回为空"
+            if len(text) < 300 and attempt == 0:
+                cb(f"[命题人改造] 输出过短({len(text)}字)，重新生成...")
+                prompt = prompt + "\n\n【注意】你上一次输出太简略，请把 4 个变式写成完整题目、生成机制写 3~5 步链条，本次至少 800 字。"
+                continue
+            if "siliconflow" in label.lower():
+                record_api_usage()
+            return text, label, ""
+        except Exception as e:
+            if attempt == 0:
+                cb(f"[命题人改造] 调用出错，重试一次：{str(e)[:80]}")
+            else:
+                return "", label, f"调用失败：{str(e)[:150]}"
+    return "", label, "连续两次调用失败"
+
+
+def archive_and_variants(question: str, model_choice: str = "math", progress_cb=None):
+    """组合：题目档案 + 命题人变式，一次生成。返回 (文本, 模型名, 错误信息)"""
+    a_txt, a_model, a_err = generate_question_archive(question, model_choice, progress_cb)
+    v_txt, v_model, v_err = generate_proposer_variants(question, model_choice, progress_cb)
+    combined = ""
+    if a_txt:
+        combined += "# 一、题目档案\n\n" + a_txt + "\n\n"
+    if v_txt:
+        combined += "# 二、命题人视角改造\n\n" + v_txt + "\n"
+    errs = "；".join(x for x in (a_err, v_err) if x)
+    return combined, f"{a_model} / {v_model}", errs

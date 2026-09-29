@@ -438,6 +438,41 @@ def run_fine(subject, category, topic, model_choice):
         yield acc + "\n" + result.get("msg", "生成失败"), None
 
 
+# ==================== 功能7：题目档案 · 命题人变式 ====================
+def _run_archive(q, model):
+    if not q or len(q.strip()) < 8:
+        return "请先输入完整题目（建议粘贴完整题面，含参数与多小问）。"
+    text, label, err = maa.generate_question_archive(q, model)
+    if text:
+        return text + f"\n\n—— 分析模型：{label}"
+    return f"⚠️ {err or '未生成'}"
+
+
+def _run_variant(q, model):
+    if not q or len(q.strip()) < 8:
+        return "请先输入完整题目（建议粘贴完整题面，含参数与多小问）。"
+    text, label, err = maa.generate_proposer_variants(q, model)
+    if text:
+        return text + f"\n\n—— 分析模型：{label}"
+    return f"⚠️ {err or '未生成'}"
+
+
+def _run_archive_both(q, model):
+    if not q or len(q.strip()) < 8:
+        return "请先输入完整题目（建议粘贴完整题面，含参数与多小问）。", None
+    text, label, err = maa.archive_and_variants(q, model)
+    if not text:
+        return f"⚠️ {err or '未生成'}", None
+    out_dir = Path(maa.OUT_RESEARCH_FOLDER) / "题目档案"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = "题目档案_" + q.strip()[:12].replace("\n", "").replace(" ", "").replace("/", "_") + ".docx"
+    try:
+        docx_path, info = maa.convert_md_to_docx(text, output_folder=str(out_dir), out_name=name)
+        return text + f"\n\n—— 分析模型：{label}\n—— 已导出 Word：{docx_path}", str(docx_path)
+    except Exception as e:
+        return text + f"\n\n—— 分析模型：{label}\n（Word 导出失败：{type(e).__name__}: {str(e)[:100]}）", None
+
+
 # ==================== 网页界面 ====================
 with gr.Blocks(title="高考数学一体化Agent · 网页版",
                theme=gr.themes.Soft()) as demo:
@@ -606,6 +641,33 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
                               outputs=[md_preview, md_dl])
         btn_docx_convert.click(convert_md_to_docx_ui, inputs=[docx_upload],
                               outputs=[docx_preview, docx_dl])
+
+    # ---------- 功能7：题目档案 · 命题人变式 ----------
+    with gr.Tab("⑦ 题目档案·命题人变式"):
+        gr.Markdown("""
+**把「一道题」升级成「一个题型的生成机制」**
+- **① 题目档案**：原题→考查知识点→教材原型→解题入口→标准解法→第二解法→关键转折点→易错点→题型识别→可迁移方法→变式方向（11 字段）
+- **② 命题人视角改造**：拆解命题基因 → 生成 4 个完整变式 → 还原题型生成机制 → 备考启示
+- 建议用「③ 档案+变式」一次生成，并自动导出 Word 到 `output_research/题目档案/`
+""")
+        archive_q = gr.Textbox(
+            label="输入题目（建议粘贴完整题面，含参数与多小问）",
+            lines=6,
+            placeholder="例如：已知函数 f(x)=x³-3x²+ax，讨论其单调性与极值。")
+        with gr.Row():
+            archive_model = gr.Dropdown(
+                label="分析模型",
+                choices=[("数学模型·DeepSeek-V3（推荐）", "math"), ("DeepSeek-R1 推理", "reasoning"), ("自动", "auto")],
+                value="math", scale=2)
+            btn_archive = gr.Button("① 生成题目档案", variant="primary", scale=1)
+            btn_variant = gr.Button("② 命题人视角改造", variant="primary", scale=1)
+            btn_archive_both = gr.Button("③ 档案+变式（推荐）", variant="secondary", scale=1)
+        archive_out = gr.Textbox(label="分析结果", lines=24, interactive=False)
+        archive_dl = gr.File(label="下载 Word 文档（仅「档案+变式」生成）")
+        btn_archive.click(_run_archive, inputs=[archive_q, archive_model], outputs=[archive_out])
+        btn_variant.click(_run_variant, inputs=[archive_q, archive_model], outputs=[archive_out])
+        btn_archive_both.click(_run_archive_both, inputs=[archive_q, archive_model],
+                               outputs=[archive_out, archive_dl])
 
 
 if __name__ == "__main__":
