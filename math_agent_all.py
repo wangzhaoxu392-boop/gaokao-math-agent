@@ -2013,6 +2013,17 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
         } for it in all_out_items],
     })
 
+    # 供「判分」复用：把本次标准答案按题号存档，避免判分时重复解题
+    try:
+        ans_path = Path(OUTPUT_FOLDER) / f"{Path(filename).stem}_answers.json"
+        ans_path.write_text(json.dumps({
+            "filename": filename,
+            "items": [{"no": it.get("no"), "question": it.get("question", ""),
+                       "answer": it.get("answer", "")} for it in all_out_items],
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
     # 直接生成docx，不再生成md
     doc = Document()
     doc.add_heading(f"试卷解答：{filename}", level=1)
@@ -2776,8 +2787,126 @@ def _fine_md_to_docx(md_text, subject, topic, out_path):
     doc.save(out_path)
 
 
+_FINE_INDEX = "_versions.json"
+
+
+def _fine_index_path(out_folder):
+    return Path(out_folder) / _FINE_INDEX
+
+
+def _load_fine_index(out_folder):
+    p = _fine_index_path(out_folder)
+    try:
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_fine_index(out_folder, idx):
+    try:
+        _fine_index_path(out_folder).write_text(
+            json.dumps(idx, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _fine_sections(md_text):
+    """按【板块名】切块 → [(标题, 正文)]，用于版本对比"""
+    secs, cur, buf = [], "（开头）", []
+    for line in (md_text or "").splitlines():
+        m = re.match(r"^\s*【(.{1,30})】\s*$", line)
+        if m:
+            body = "\n".join(buf).strip()
+            if body:
+                secs.append((cur, body))
+            cur, buf = m.group(1), []
+        else:
+            buf.append(line)
+    body = "\n".join(buf).strip()
+    if body:
+        secs.append((cur, body))
+    return secs
+
+
+def fine_versions(subject, topic, out_folder=None):
+    """某专题的历史版本列表（按生成顺序升序）"""
+    if out_folder is None:
+        out_folder = Path(OUT_RESEARCH_FOLDER) / "精细化内容"
+    return list(_load_fine_index(out_folder).get(f"{subject}|{topic}", []))
+
+
+def _fine_read_md(out_folder, info):
+    try:
+        return (Path(out_folder) / info.get("md", "")).read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def fine_compare(subject, topic, va, vb, out_folder=None):
+    """对比同一专题的两个版本。返回 (markdown 对比表, A 的 docx 路径, B 的 docx 路径)"""
+    if out_folder is None:
+        out_folder = Path(OUT_RESEARCH_FOLDER) / "精细化内容"
+    versions = fine_versions(subject, topic, out_folder)
+
+    def pick(n):
+        for v in versions:
+            if str(v.get("v")) == str(n):
+                return v
+        return None
+
+    A, B = pick(va), pick(vb)
+    if not A or not B:
+        return "⚠️ 未找到所选版本，请点「刷新版本」后重试。", None, None
+
+    secs_a = _fine_sections(_fine_read_md(out_folder, A))
+    secs_b = _fine_sections(_fine_read_md(out_folder, B))
+    da, db = dict(secs_a), dict(secs_b)
+    order = []
+    for t, _ in secs_a + secs_b:
+        if t not in order:
+            order.append(t)
+
+    rows = []
+    for t in order:
+        ca, cb = len(da.get(t, "")), len(db.get(t, ""))
+        if ca == 0:
+            flag = "🆕 新增"
+        elif cb == 0:
+            flag = "❌ 缺失"
+        elif cb > ca:
+            flag = f"↑ +{cb - ca}"
+        elif cb < ca:
+            flag = f"↓ {cb - ca}"
+        else:
+            flag = "＝"
+        rows.append(f"| {t} | {ca} | {cb} | {flag} |")
+
+    lines = [
+        f"### 版本对比：{subject} · {topic}",
+        "",
+        f"- **A = v{A.get('v')}** ｜ {A.get('time')} ｜ {A.get('model')} ｜ "
+        f"{A.get('chars')} 字 ｜ {A.get('sections')} 板块",
+        f"- **B = v{B.get('v')}** ｜ {B.get('time')} ｜ {B.get('model')} ｜ "
+        f"{B.get('chars')} 字 ｜ {B.get('sections')} 板块",
+        "",
+        "| 板块 | A 字数 | B 字数 | 变化 |",
+        "|---|---|---|---|",
+        *rows,
+        "",
+        "> 「变化」以 B 相对 A 计：↑ 变长、↓ 变短、🆕 新增、❌ 缺失。可下载两份 Word 逐段比对后选用。",
+    ]
+    docx_a = str(Path(out_folder) / A.get("docx", ""))
+    docx_b = str(Path(out_folder) / B.get("docx", ""))
+    return "\n".join(lines), docx_a, docx_b
+
+
 def fine_generate_and_save(subject, topic, model_choice="auto", out_folder=None, progress_cb=None):
-    """精细化生成并保存 Word。返回 (成功标志, 提示信息, 文件路径)"""
+    """精细化生成并保存 Word。每次生成都是新版本（v1/v2/…），不覆盖旧稿。
+    返回 (成功标志, 提示信息, 文件路径)"""
     if out_folder is None:
         out_folder = Path(OUT_RESEARCH_FOLDER) / "精细化内容"
     out_folder = Path(out_folder)
@@ -2787,14 +2916,150 @@ def fine_generate_and_save(subject, topic, model_choice="auto", out_folder=None,
     if err:
         return False, f"❌ 生成失败：{err}", None
 
+    idx = _load_fine_index(out_folder)
+    key = f"{subject}|{topic}"
+    versions = idx.get(key, [])
+    vno = len(versions) + 1
+    stamp = time.strftime("%Y%m%d-%H%M%S")
     safe = re.sub(r'[\\/:*?"<>|]', "_", topic)
-    out_path = out_folder / f"{subject}_{safe}_精细化精讲.docx"
+    base = f"{subject}_{safe}_v{vno}_{stamp}"
+    out_path = out_folder / f"{base}.docx"
+    md_path = out_folder / f"{base}.md"
     try:
         _fine_md_to_docx(md_text, subject, topic, str(out_path))
+        md_path.write_text(md_text, encoding="utf-8")
     except Exception as e:
         return False, f"❌ Word 生成失败：{str(e)[:200]}", None
 
-    return True, f"✅ 已生成：{out_path.name}（模型：{label}）", str(out_path)
+    secs = _fine_sections(md_text)
+    versions.append({
+        "v": vno,
+        "time": time.strftime("%Y-%m-%d %H:%M"),
+        "model": label,
+        "chars": len(md_text),
+        "sections": len(secs),
+        "docx": out_path.name,
+        "md": md_path.name,
+    })
+    idx[key] = versions
+    _save_fine_index(out_folder, idx)
+    return (True,
+            f"✅ 已生成 v{vno}：{out_path.name}（模型：{label}，{len(md_text)} 字，{len(secs)} 板块）"
+            f"\n可在「历史版本与对比」里与旧版本比较后选用。",
+            str(out_path))
+
+
+# ========================批量判分（学生答案 vs 标准答案）========================
+_GRADE_PROMPT = """你是资深高考数学阅卷老师，请严格按高考评分标准批改这道题。
+
+【题目】
+{question}
+
+【标准答案】
+{standard}
+
+【学生答案】
+{student}
+
+批改要求：
+1. 先独立核对标准答案的每一步，再逐步比对学生的推导过程；
+2. 按步骤给分：关键步骤正确得分，计算错误、跳步、漏条件、结论错误扣分；
+3. 满分按题型自行判定（选择/填空 5 分，解答题 10~12 分），写在 max 字段；
+4. 学生答案为空或完全离题，score 记 0；
+5. 只输出一个 JSON 对象，不要输出任何其他文字或代码块标记，格式：
+{{"score": 数字, "max": 数字, "issues": ["关键错误1", "关键错误2"], "comment": "一句话总评"}}
+"""
+
+
+def _split_numbered_answers(text):
+    """把「1. xxx 2. xxx」形式的学生答案按题号切开 → {题号: 答案}"""
+    out = {}
+    pat = re.compile(r"(?ms)^\s*(\d+)\s*[.、．]\s*(.*?)(?=^\s*\d+\s*[.、．]\s*|\Z)")
+    for m in pat.finditer(text or ""):
+        body = m.group(2).strip()
+        if body:
+            out[int(m.group(1))] = body
+    return out
+
+
+def _extract_json_obj(s):
+    """从模型输出里抠出第一个 JSON 对象（兼容 ```json 包裹）"""
+    s = (s or "").strip()
+    s = re.sub(r"^\s*```(?:json)?|```\s*$", "", s, flags=re.M).strip()
+    start, end = s.find("{"), s.rfind("}")
+    if start >= 0 and end > start:
+        s = s[start:end + 1]
+    data = _safe_json_loads(s)
+    return data if isinstance(data, dict) else {}
+
+
+def grade_one(question, standard, student, model_choice="math"):
+    """单题判分。返回 (得分, 满分, 问题摘要, 评语)"""
+    llm_obj, _label = get_llm_for_choice(model_choice, default="llm_math")
+    prompt = _GRADE_PROMPT.format(
+        question=(question or "")[:2000],
+        standard=(standard or "")[:3000],
+        student=(student or "（未作答）")[:2000])
+    try:
+        resp = llm_obj.invoke([{"role": "user", "content": prompt}])
+        data = _extract_json_obj(getattr(resp, "content", str(resp)))
+    except Exception as e:
+        return 0.0, 0.0, f"判分调用失败：{type(e).__name__}：{str(e)[:60]}", ""
+    try:
+        score = float(data.get("score", 0) or 0)
+        full = float(data.get("max", 0) or 0)
+    except (TypeError, ValueError):
+        score, full = 0.0, 0.0
+    if full <= 0:
+        full = 12.0
+    issues = data.get("issues") or []
+    if isinstance(issues, str):
+        issues = [issues]
+    issues_text = "；".join(str(x) for x in issues[:3])
+    return max(0.0, min(score, full)), full, issues_text, str(data.get("comment", "") or "")
+
+
+def grade_student_file(paper_filename, student_text, model_choice="math", progress_cb=None):
+    """按题号对齐标准答案与学生答案并逐题判分。
+    返回 (报告 markdown, 表格行, 总分, 满分, 错误信息)"""
+    stem = Path(paper_filename).stem
+    ans_path = Path(OUTPUT_FOLDER) / f"{stem}_answers.json"
+    if not ans_path.exists():
+        return None, [], 0.0, 0.0, (
+            f"未找到标准答案（{ans_path.name}）。请先对「{paper_filename}」执行一次「批量做题」。")
+    try:
+        items = json.loads(ans_path.read_text(encoding="utf-8")).get("items", [])
+    except Exception as e:
+        return None, [], 0.0, 0.0, f"标准答案读取失败：{e}"
+    if not items:
+        return None, [], 0.0, 0.0, "标准答案文件为空，请重新批量做题。"
+
+    students = _split_numbered_answers(student_text)
+    cb = progress_cb or (lambda m: None)
+    rows, total, total_max = [], 0.0, 0.0
+    for it in items:
+        no = it.get("no")
+        stu = students.get(int(no)) if no is not None else None
+        cb(f"判分第 {no} 题……")
+        score, full, issues, comment = grade_one(
+            it.get("question", ""), it.get("answer", ""), stu, model_choice)
+        total += score
+        total_max += full
+        rows.append([no, f"{score:g}", f"{full:g}", issues or "—", comment or ""])
+
+    pct = (total / total_max * 100) if total_max else 0.0
+    md = [
+        f"# 试卷判分报告：{paper_filename}",
+        "",
+        f"- 总得分：**{total:g} / {total_max:g}**（得分率 {pct:.1f}%）",
+        f"- 题数：{len(items)}；判分模型：{_MATH_PROVIDER}:{_MATH_MODEL_NAME}",
+        "",
+        "| 题号 | 得分 | 满分 | 主要问题 | 评语 |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        md.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} |")
+    return "\n".join(md), rows, total, total_max, ""
 
 
 # ========================主菜单========================

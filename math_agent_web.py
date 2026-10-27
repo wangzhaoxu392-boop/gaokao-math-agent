@@ -745,6 +745,86 @@ def refresh_side():
     return _dashboard_html(), gr.update(choices=choices), info
 
 
+# ==================== 精细化版本对比 / 批量判分 ====================
+_FINE_OUT = Path(maa.OUT_RESEARCH_FOLDER) / "精细化内容"
+
+
+def fine_versions_update(subject, topic):
+    vs = maa.fine_versions(subject, topic, out_folder=_FINE_OUT)
+    if not vs:
+        return (gr.update(choices=[], value=None), gr.update(choices=[], value=None),
+                "该专题还没有历史版本（生成一次后会出现 v1）")
+    choices = [(f"v{v['v']} · {v['time']} · {v['chars']}字 · {v['sections']}板块", str(v["v"]))
+               for v in vs]
+    latest = str(vs[-1]["v"])
+    prev = str(vs[-2]["v"]) if len(vs) > 1 else latest
+    return (gr.update(choices=choices, value=latest),
+            gr.update(choices=choices, value=prev),
+            f"共 {len(vs)} 个版本（A/B 任选两个对比，下载后逐段择优）")
+
+
+def fine_compare_ui(subject, topic, a, b):
+    if not a or not b:
+        return "请先选择两个版本。", None, None
+    text, pa, pb = maa.fine_compare(subject, topic, a, b, out_folder=_FINE_OUT)
+    return text, pa, pb
+
+
+def run_grade(paper, student_file, model_choice):
+    if isinstance(paper, (list, tuple)):
+        paper = paper[0] if paper else ""
+    if not paper:
+        yield "请先在「批量做题」里选一份已做过的试卷。", None, None
+        return
+    if student_file is None:
+        yield "请上传学生答案文件（按「1. … 2. …」编号）。", None, None
+        return
+    yield "⏳ 正在判分（每题一次模型调用），请稍候……", None, None
+    try:
+        text = maa.read_batch_file(Path(student_file.name))
+    except Exception as e:
+        yield f"❌ 学生答案读取失败：{e}", None, None
+        return
+
+    progress, done, result = [], threading.Event(), {}
+
+    def worker():
+        try:
+            md, rows, total, total_max, err = maa.grade_student_file(
+                paper, text, model_choice=model_choice, progress_cb=progress.append)
+            result.update({"md": md, "rows": rows, "total": total,
+                           "max": total_max, "err": err})
+        except Exception as e:
+            result["err"] = f"{type(e).__name__}: {e}"
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    acc, seen = "", 0
+    while not done.is_set():
+        while seen < len(progress):
+            acc += progress[seen] + "\n"
+            seen += 1
+        yield (acc or "⏳ 判分中……"), None, None
+        time.sleep(1.0)
+    while seen < len(progress):
+        acc += progress[seen] + "\n"
+        seen += 1
+    if result.get("err"):
+        yield f"❌ {result['err']}", None, None
+        return
+
+    md, rows = result["md"], result["rows"]
+    path = None
+    try:
+        path, _info = maa.convert_md_to_docx(
+            md, output_folder=str(OUTPUT_FOLDER), out_name=f"{Path(paper).stem}_判分报告.docx")
+    except Exception:
+        pass
+    yield (f"✅ 判分完成：**{result['total']:g} / {result['max']:g}**\n\n{acc}",
+           (rows or None), (str(path) if path else None))
+
+
 # ==================== 网页界面 ====================
 with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
     gr.Markdown(f"""# 🧮 高考数学一体化 Agent
@@ -792,7 +872,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                 hist_info = gr.Markdown("")
 
             btn_solve.click(solve_one, inputs=[q_input, model_choice],
-                            outputs=[out_text, out_plot, run_stats])
+                            outputs=[out_text, out_plot, run_stats],
+                            concurrency_id="chat", concurrency_limit=1)
             btn_clear.click(clear_memory, outputs=[out_text])
             btn_export.click(export_answer, inputs=[out_text, q_input], outputs=[export_file])
             btn_hist_load.click(history_load, inputs=[hist_dd],
@@ -816,10 +897,13 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                 btn_archive_both = gr.Button("③ 档案+变式（推荐）", variant="secondary", scale=1)
             archive_out = gr.Textbox(label="分析结果", lines=22, interactive=False, buttons=["copy"])
             archive_dl = gr.File(label="下载 Word 文档（仅「档案+变式」生成）")
-            btn_archive.click(_run_archive, inputs=[archive_q, archive_model], outputs=[archive_out])
-            btn_variant.click(_run_variant, inputs=[archive_q, archive_model], outputs=[archive_out])
+            btn_archive.click(_run_archive, inputs=[archive_q, archive_model], outputs=[archive_out],
+                              concurrency_id="archive", concurrency_limit=1)
+            btn_variant.click(_run_variant, inputs=[archive_q, archive_model], outputs=[archive_out],
+                              concurrency_id="archive", concurrency_limit=1)
             btn_archive_both.click(_run_archive_both, inputs=[archive_q, archive_model],
-                                   outputs=[archive_out, archive_dl])
+                                   outputs=[archive_out, archive_dl],
+                                   concurrency_id="archive", concurrency_limit=1)
 
         # ========== ③ 批量做题 ==========
         with gr.Tab("③ 批量做题"):
@@ -827,6 +911,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                         "余额有限时把「模型档位」切到省钱档。")
             batch_file = gr.Dropdown(
                 label="选择 batch_input 中的试卷（可多选）", multiselect=True,
+                allow_custom_value=True,
                 choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
             with gr.Row():
                 batch_model = gr.Dropdown(
@@ -844,10 +929,28 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                 label="逐题统计", interactive=False, wrap=True,
                 headers=["文件", "题号", "状态", "模型", "用时", "费用", "token 入/出"])
             batch_dl = gr.File(label="下载解答文档（Word + PDF）")
+            with gr.Accordion("📝 判分（可选：上传学生答案，逐题给分）", open=False):
+                gr.Markdown("先对上面的试卷跑一次「批量做题」（会自动保存标准答案），"
+                            "再上传按「1. … 2. …」编号的学生答案，即可逐题给分并生成报告。")
+                student_file = gr.File(label="学生答案文件（txt / md / docx）", file_count="single")
+                with gr.Row():
+                    grade_model = gr.Dropdown(
+                        label="判分模型", scale=3, value="math",
+                        choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning")])
+                    btn_grade = gr.Button("开始判分", variant="primary", scale=1)
+                grade_log = gr.Textbox(label="判分日志", lines=6, interactive=False)
+                grade_table = gr.Dataframe(
+                    label="逐题得分", interactive=False, wrap=True,
+                    headers=["题号", "得分", "满分", "主要问题", "评语"])
+                grade_dl = gr.File(label="下载判分报告（Word）")
             batch_upload.upload(upload_batch, inputs=[batch_upload], outputs=[batch_msg, batch_file])
             btn_refresh_b.click(refresh_batch, outputs=[batch_file])
             btn_batch.click(run_batch, inputs=[batch_file, batch_model, batch_tier],
-                            outputs=[batch_log, batch_dl, batch_table])
+                            outputs=[batch_log, batch_dl, batch_table],
+                            concurrency_id="batch", concurrency_limit=1)
+            btn_grade.click(run_grade, inputs=[batch_file, student_file, grade_model],
+                            outputs=[grade_log, grade_table, grade_dl],
+                            concurrency_id="grade", concurrency_limit=1)
 
         # ========== ④ 真题教研 ==========
         with gr.Tab("④ 真题教研"):
@@ -855,6 +958,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                         "整份试卷约 1~4 小时，建议先用单份试跑。")
             exam_file = gr.Dropdown(
                 label="选择 raw_exam_files 中的真题（可多选）", multiselect=True,
+                allow_custom_value=True,
                 choices=_list_files(RAW_EXAM_FOLDER, (".pdf", ".docx")))
             with gr.Row():
                 research_model = gr.Dropdown(
@@ -871,7 +975,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
             exam_upload.upload(upload_exam, inputs=[exam_upload], outputs=[exam_msg, exam_file])
             btn_refresh_e.click(refresh_exam, outputs=[exam_file])
             btn_research.click(run_research, inputs=[exam_file, research_model],
-                               outputs=[exam_log, exam_dl])
+                               outputs=[exam_log, exam_dl],
+                               concurrency_id="research", concurrency_limit=1)
 
         # ========== ⑤ 精细化讲义 ==========
         with gr.Tab("⑤ 精细化讲义"):
@@ -891,10 +996,31 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                 btn_fine = gr.Button("生成讲义", variant="primary", scale=1)
             fine_log = gr.Textbox(label="生成日志", lines=14, interactive=False)
             fine_dl = gr.File(label="下载 Word 讲义")
+            with gr.Accordion("🕘 历史版本与对比（同专题重复生成保留 v1 / v2 / …，不覆盖旧稿）", open=False):
+                gr.Markdown("每次生成都是新版本。选定两个版本点「对比」可看板块级字数变化，"
+                            "两份 Word 都能下载，自己逐段择优。")
+                with gr.Row():
+                    ver_a = gr.Dropdown(label="版本 A", choices=[], scale=1, allow_custom_value=True)
+                    ver_b = gr.Dropdown(label="版本 B", choices=[], scale=1, allow_custom_value=True)
+                    btn_ver_refresh = gr.Button("刷新版本", scale=1, min_width=100)
+                    btn_ver_cmp = gr.Button("对比", variant="primary", scale=1, min_width=90)
+                ver_info = gr.Markdown("")
+                ver_md = gr.Markdown("")
+                with gr.Row():
+                    ver_file_a = gr.File(label="下载版本 A")
+                    ver_file_b = gr.File(label="下载版本 B")
             fine_subject.change(_fine_update_cats, inputs=[fine_subject], outputs=[fine_category])
             fine_category.change(_fine_update_topics, inputs=[fine_subject, fine_category], outputs=[fine_topic])
+            fine_topic.change(fine_versions_update, inputs=[fine_subject, fine_topic],
+                              outputs=[ver_a, ver_b, ver_info])
+            btn_ver_refresh.click(fine_versions_update, inputs=[fine_subject, fine_topic],
+                                  outputs=[ver_a, ver_b, ver_info])
+            btn_ver_cmp.click(fine_compare_ui, inputs=[fine_subject, fine_topic, ver_a, ver_b],
+                              outputs=[ver_md, ver_file_a, ver_file_b],
+                              concurrency_id="fine", concurrency_limit=1)
             btn_fine.click(run_fine, inputs=[fine_subject, fine_category, fine_topic, fine_model],
-                           outputs=[fine_log, fine_dl])
+                           outputs=[fine_log, fine_dl],
+                           concurrency_id="fine", concurrency_limit=1)
 
         # ========== ⑥ 知识库 ==========
         with gr.Tab("⑥ 知识库"):
@@ -919,7 +1045,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
             with gr.Accordion("备选：重建旧版 RAG 向量库（未编译 Wiki 时回退用）", open=False):
                 btn_build_legacy = gr.Button("重建旧版向量库")
             kb_upload.upload(upload_kb, inputs=[kb_upload], outputs=[kb_msg, kb_files])
-            btn_wiki_build.click(run_build_wiki, inputs=[wiki_model], outputs=[kb_log, wiki_status])
+            btn_wiki_build.click(run_build_wiki, inputs=[wiki_model], outputs=[kb_log, wiki_status],
+                                 concurrency_id="wiki", concurrency_limit=1)
             btn_wiki_lint.click(run_wiki_lint, outputs=[kb_log])
             btn_wiki_heal.click(run_wiki_heal, outputs=[kb_log, wiki_status])
             btn_build_legacy.click(build_kb, outputs=[kb_log])
@@ -952,6 +1079,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
 if __name__ == "__main__":
     # 并发设为 1，避免与本地 Ollama 单实例推理冲突
     # inbrowser=False：避免和启动脚本自动打开浏览器冲突（否则会开两个网页）
-    demo.queue(default_concurrency_limit=1).launch(
+    # 队列：默认并发 4，各功能用独立 concurrency_id 互不阻塞
+    # （单题/批量/教研/讲义/知识库可同时跑；同一功能内部仍串行，避免抢 Ollama 与 API）
+    demo.queue(default_concurrency_limit=4).launch(
         server_name="127.0.0.1", server_port=7860, inbrowser=False,
         theme=gr.themes.Soft())
