@@ -95,7 +95,7 @@ def clear_memory():
     except Exception as e:
         return f"清空失败：{e}"
 
-def solve_one(question, model_choice):
+def solve_one(question, model_choice, math_model=""):
     if not question or not question.strip():
         yield "请输入题目。", None, ""
         return
@@ -107,7 +107,8 @@ def solve_one(question, model_choice):
     before = plot.stat().st_mtime if plot.exists() else None
     t0 = time.time()
     try:
-        ans, model_used = maa.run_question(maa.graph_chat, question, cfg, model_choice=model_choice)
+        ans, model_used = maa.run_question(maa.graph_chat, question, cfg, model_choice=model_choice,
+                                           math_model=(math_model or None))
     except Exception as e:
         emsg = str(e)
         elow = emsg.lower()
@@ -825,6 +826,21 @@ def run_grade(paper, student_file, model_choice):
            (rows or None), (str(path) if path else None))
 
 
+def refresh_profile():
+    rows, wrong, summary = maa.learning_profile()
+    return summary, (rows or None), (wrong or None)
+
+
+def export_wrongbook_ui():
+    try:
+        path = maa.export_wrongbook()
+    except Exception as e:
+        return None, f"❌ 导出失败：{type(e).__name__}: {e}"
+    if not path:
+        return None, "暂无错题可导出（需先判分，且存在得分率低于 60% 的题）。"
+    return str(path), f"✅ 已导出错题本：{Path(path).name}"
+
+
 # ==================== 网页界面 ====================
 with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
     gr.Markdown(f"""# 🧮 高考数学一体化 Agent
@@ -854,6 +870,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                     choices=[("自动（按题型切换）", "auto"),
                              (_REASON_LABEL, "reasoning"),
                              (_MATH_LABEL, "math")])
+                solve_tier = gr.Dropdown(label="档位", scale=1, value="", choices=_MATH_TIERS)
                 btn_solve = gr.Button("开始解答", variant="primary", scale=1)
                 btn_clear = gr.Button("清空记忆", scale=1)
             run_stats = gr.Markdown("")
@@ -871,7 +888,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                     btn_hist_clear = gr.Button("清空历史", scale=1)
                 hist_info = gr.Markdown("")
 
-            btn_solve.click(solve_one, inputs=[q_input, model_choice],
+            btn_solve.click(solve_one, inputs=[q_input, model_choice, solve_tier],
                             outputs=[out_text, out_plot, run_stats],
                             concurrency_id="chat", concurrency_limit=1)
             btn_clear.click(clear_memory, outputs=[out_text])
@@ -941,7 +958,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                 grade_log = gr.Textbox(label="判分日志", lines=6, interactive=False)
                 grade_table = gr.Dataframe(
                     label="逐题得分", interactive=False, wrap=True,
-                    headers=["题号", "得分", "满分", "主要问题", "评语"])
+                    headers=["题号", "得分", "满分", "考点", "主要问题", "评语"])
                 grade_dl = gr.File(label="下载判分报告（Word）")
             batch_upload.upload(upload_batch, inputs=[batch_upload], outputs=[batch_msg, batch_file])
             btn_refresh_b.click(refresh_batch, outputs=[batch_file])
@@ -1051,8 +1068,28 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
             btn_wiki_heal.click(run_wiki_heal, outputs=[kb_log, wiki_status])
             btn_build_legacy.click(build_kb, outputs=[kb_log])
 
-        # ========== ⑦ 格式转换 ==========
-        with gr.Tab("⑦ 格式转换"):
+        # ========== ⑦ 学情画像 ==========
+        with gr.Tab("⑦ 学情画像"):
+            gr.Markdown("汇总历次**判分记录**：按考点看平均得分率，定位薄弱项；错题可一键导出 Word 打印。"
+                        "（数据来自 ③ 批量做题里的「判分」，判一次就会累积一次）")
+            with gr.Row():
+                btn_profile = gr.Button("🔄 刷新画像", variant="primary", scale=1)
+                btn_wrongbook = gr.Button("📄 导出错题本", scale=1)
+            profile_summary = gr.Markdown("点击「刷新画像」加载。")
+            profile_table = gr.Dataframe(
+                label="考点画像（按得分率升序，最薄弱的在最上面）", interactive=False, wrap=True,
+                headers=["考点", "题数", "平均得分率", "评价"])
+            wrong_table = gr.Dataframe(
+                label="错题清单（得分率 < 60%）", interactive=False, wrap=True,
+                headers=["时间", "试卷", "题号", "考点", "得分", "主要问题"])
+            wrongbook_file = gr.File(label="下载错题本")
+            btn_profile.click(refresh_profile,
+                              outputs=[profile_summary, profile_table, wrong_table])
+            btn_wrongbook.click(export_wrongbook_ui,
+                                outputs=[wrongbook_file, profile_summary])
+
+        # ========== ⑧ 格式转换 ==========
+        with gr.Tab("⑧ 格式转换"):
             gr.Markdown("docx / pdf / txt → Markdown，Markdown → Word。适合把外部资料转成可入库/可教学的格式。")
             with gr.Row():
                 with gr.Column():

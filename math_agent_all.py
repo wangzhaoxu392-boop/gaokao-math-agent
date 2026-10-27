@@ -2967,7 +2967,7 @@ _GRADE_PROMPT = """你是资深高考数学阅卷老师，请严格按高考评�
 3. 满分按题型自行判定（选择/填空 5 分，解答题 10~12 分），写在 max 字段；
 4. 学生答案为空或完全离题，score 记 0；
 5. 只输出一个 JSON 对象，不要输出任何其他文字或代码块标记，格式：
-{{"score": 数字, "max": 数字, "issues": ["关键错误1", "关键错误2"], "comment": "一句话总评"}}
+{{"score": 数字, "max": 数字, "knowledge": "考点（如 导数·极值）", "issues": ["关键错误1", "关键错误2"], "comment": "一句话总评"}}
 """
 
 
@@ -2994,7 +2994,7 @@ def _extract_json_obj(s):
 
 
 def grade_one(question, standard, student, model_choice="math"):
-    """单题判分。返回 (得分, 满分, 问题摘要, 评语)"""
+    """单题判分。返回 (得分, 满分, 问题摘要, 评语, 考点)"""
     llm_obj, _label = get_llm_for_choice(model_choice, default="llm_math")
     prompt = _GRADE_PROMPT.format(
         question=(question or "")[:2000],
@@ -3004,7 +3004,7 @@ def grade_one(question, standard, student, model_choice="math"):
         resp = llm_obj.invoke([{"role": "user", "content": prompt}])
         data = _extract_json_obj(getattr(resp, "content", str(resp)))
     except Exception as e:
-        return 0.0, 0.0, f"判分调用失败：{type(e).__name__}：{str(e)[:60]}", ""
+        return 0.0, 0.0, f"判分调用失败：{type(e).__name__}：{str(e)[:60]}", "", "未分类"
     try:
         score = float(data.get("score", 0) or 0)
         full = float(data.get("max", 0) or 0)
@@ -3016,11 +3016,13 @@ def grade_one(question, standard, student, model_choice="math"):
     if isinstance(issues, str):
         issues = [issues]
     issues_text = "；".join(str(x) for x in issues[:3])
-    return max(0.0, min(score, full)), full, issues_text, str(data.get("comment", "") or "")
+    knowledge = str(data.get("knowledge", "") or "").strip() or "未分类"
+    return (max(0.0, min(score, full)), full, issues_text,
+            str(data.get("comment", "") or ""), knowledge)
 
 
 def grade_student_file(paper_filename, student_text, model_choice="math", progress_cb=None):
-    """按题号对齐标准答案与学生答案并逐题判分。
+    """按题号对齐标准答案与学生答案并逐题判分；结果落盘供学情画像聚合。
     返回 (报告 markdown, 表格行, 总分, 满分, 错误信息)"""
     stem = Path(paper_filename).stem
     ans_path = Path(OUTPUT_FOLDER) / f"{stem}_answers.json"
@@ -3041,11 +3043,11 @@ def grade_student_file(paper_filename, student_text, model_choice="math", progre
         no = it.get("no")
         stu = students.get(int(no)) if no is not None else None
         cb(f"判分第 {no} 题……")
-        score, full, issues, comment = grade_one(
+        score, full, issues, comment, knowledge = grade_one(
             it.get("question", ""), it.get("answer", ""), stu, model_choice)
         total += score
         total_max += full
-        rows.append([no, f"{score:g}", f"{full:g}", issues or "—", comment or ""])
+        rows.append([no, f"{score:g}", f"{full:g}", knowledge, issues or "—", comment or ""])
 
     pct = (total / total_max * 100) if total_max else 0.0
     md = [
@@ -3054,12 +3056,103 @@ def grade_student_file(paper_filename, student_text, model_choice="math", progre
         f"- 总得分：**{total:g} / {total_max:g}**（得分率 {pct:.1f}%）",
         f"- 题数：{len(items)}；判分模型：{_MATH_PROVIDER}:{_MATH_MODEL_NAME}",
         "",
-        "| 题号 | 得分 | 满分 | 主要问题 | 评语 |",
-        "|---|---|---|---|---|",
+        "| 题号 | 得分 | 满分 | 考点 | 主要问题 | 评语 |",
+        "|---|---|---|---|---|---|",
     ]
     for r in rows:
-        md.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} |")
+        md.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]} | {r[5]} |")
+    md += ["", "> 判分记录已保存，可到「⑧ 学情画像」查看考点薄弱项与错题本。"]
+
+    # 落盘：供学情画像聚合（每题保留题干、学生答案、考点、扣分点）
+    try:
+        rec_dir = Path(OUTPUT_FOLDER) / "判分记录"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        qmap = {str(x.get("no")): x.get("question", "") for x in items}
+        rec = {
+            "paper": paper_filename,
+            "time": time.strftime("%Y-%m-%d %H:%M"),
+            "total": total,
+            "max": total_max,
+            "items": [{
+                "no": r[0],
+                "score": float(r[1]),
+                "max": float(r[2]),
+                "knowledge": r[3],
+                "issues": r[4],
+                "comment": r[5],
+                "question": qmap.get(str(r[0]), ""),
+                "student": students.get(int(r[0]), "") if str(r[0]).isdigit() else "",
+            } for r in rows],
+        }
+        (rec_dir / f"{stem}_{time.strftime('%Y%m%d-%H%M%S')}.json").write_text(
+            json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
     return "\n".join(md), rows, total, total_max, ""
+
+
+def _load_grade_records():
+    rec_dir = Path(OUTPUT_FOLDER) / "判分记录"
+    if not rec_dir.exists():
+        return []
+    out = []
+    for p in sorted(rec_dir.glob("*.json")):
+        try:
+            out.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return out
+
+
+def learning_profile(weak_threshold=0.6):
+    """聚合所有判分记录 → (考点画像行, 错题行, 概述文本)"""
+    recs = _load_grade_records()
+    agg, wrong = {}, []
+    for r in recs:
+        for it in r.get("items", []):
+            k = (it.get("knowledge") or "未分类").strip() or "未分类"
+            a = agg.setdefault(k, {"n": 0, "score": 0.0, "full": 0.0})
+            a["n"] += 1
+            a["score"] += float(it.get("score") or 0)
+            a["full"] += float(it.get("max") or 0)
+            full = float(it.get("max") or 0) or 1.0
+            rate = float(it.get("score") or 0) / full
+            if rate < weak_threshold:
+                wrong.append([r.get("time", ""), r.get("paper", ""), it.get("no"), k,
+                              f'{float(it.get("score") or 0):g}/{float(it.get("max") or 0):g}',
+                              (it.get("issues") or "")[:80]])
+
+    rows = []
+    for k, a in sorted(agg.items(),
+                       key=lambda kv: (kv[1]["score"] / kv[1]["full"]) if kv[1]["full"] else 1.0):
+        rate = (a["score"] / a["full"] * 100) if a["full"] else 0.0
+        tag = "⚠️ 薄弱" if rate < 60 else ("中等" if rate < 80 else "较好")
+        rows.append([k, a["n"], f"{rate:.0f}%", tag])
+
+    if not recs:
+        summary = "还没有判分记录。先到 ③ 批量做题里上传学生答案判分一次，这里会自动生成画像。"
+    else:
+        n_items = sum(a["n"] for a in agg.values())
+        summary = (f"共 {len(recs)} 次判分 / {n_items} 道题；"
+                   f"错题 {len(wrong)} 道；薄弱考点 {sum(1 for r in rows if r[3].startswith('⚠️'))} 个。")
+    return rows, wrong, summary
+
+
+def export_wrongbook(name=None):
+    """把错题导出为 Word，返回文件路径（无错题返回 None）"""
+    rows, wrong, _ = learning_profile()
+    if not wrong:
+        return None
+    md = ["# 错题本", "", f"生成时间：{time.strftime('%Y-%m-%d %H:%M')}",
+          "", f"共 {len(wrong)} 道错题（得分率低于 60%）。", ""]
+    for r in wrong:
+        md += [f"## 考点：{r[3]} ｜ 得分 {r[4]}", "",
+               f"- 来源：{r[0]} ｜ {r[1]} 第 {r[2]} 题",
+               f"- 主要问题：{r[5]}", ""]
+    fname = name or f"错题本_{time.strftime('%Y%m%d')}.docx"
+    path, _info = convert_md_to_docx("\n".join(md),
+                                     output_folder=str(OUTPUT_FOLDER), out_name=fname)
+    return str(path)
 
 
 # ========================主菜单========================
