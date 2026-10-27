@@ -906,7 +906,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                     choices=[("自动（按题型切换）", "auto"),
                              (_REASON_LABEL, "reasoning"),
                              (_MATH_LABEL, "math")])
-                solve_tier = gr.Dropdown(label="档位", scale=1, value="", choices=_MATH_TIERS)
+                solve_tier = gr.Dropdown(label="档位（仅数学模型）", scale=1, value="", choices=_MATH_TIERS)
                 btn_solve = gr.Button("开始解答", variant="primary", scale=1)
                 btn_clear = gr.Button("清空记忆", scale=1)
             run_stats = gr.Markdown("")
@@ -972,7 +972,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                     choices=[("自动（按题型切换）", "auto"),
                              (_REASON_LABEL, "reasoning"),
                              (_MATH_LABEL, "math")])
-                batch_tier = gr.Dropdown(label="模型档位", scale=1, choices=_MATH_TIERS, value="")
+                batch_tier = gr.Dropdown(label="模型档位（仅数学模型）", scale=1, choices=_MATH_TIERS, value="")
                 btn_refresh_b = gr.Button("刷新", scale=1, min_width=90)
                 btn_batch = gr.Button("开始批量做题", variant="primary", scale=1)
                 btn_stop_b = gr.Button("⏹ 停止", scale=1, min_width=90)
