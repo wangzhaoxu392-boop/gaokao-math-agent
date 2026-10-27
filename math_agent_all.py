@@ -706,9 +706,10 @@ def _safe_wiki_name(title: str) -> str:
     return t[:40] or "未命名"
 
 
-def build_wiki(progress_cb=None, model_choice="auto"):
+def build_wiki(progress_cb=None, model_choice="auto", should_stop=None):
     """Karpathy 编译：knowledge_docs → wiki/ 结构化词条 + 索引 + 向量检索库
-    model_choice: auto(默认快速模型)/reasoning(DeepSeek)/math(API数学模型)"""
+    model_choice: auto(默认快速模型)/reasoning(DeepSeek)/math(API数学模型)
+    should_stop: 可选回调，返回 True 时在下一个分块前停止（已编译的条目保留）"""
     def _report(m):
         if progress_cb is not None:
             try:
@@ -733,6 +734,9 @@ def build_wiki(progress_cb=None, model_choice="auto"):
         chunks = _split_knowledge_text(content)
         _report(f"  {fp.name} 共 {len(chunks)} 块，逐块编译中")
         for ci, ck in enumerate(chunks):
+            if should_stop is not None and should_stop():
+                _report("⏹ 已停止编译（已完成部分保留，可稍后续编）")
+                return None
             _report(f"  ▶ 第 {ci+1}/{len(chunks)} 块提炼词条...")
             arr = None
             for attempt in range(2):  # 解析失败自动重试一次
@@ -1859,10 +1863,11 @@ def _is_exam_question(text: str) -> bool:
 
 
 def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resume=True,
-                     math_model=None):
+                     math_model=None, should_stop=None):
     """批量解答一份试卷。支持断点续跑：每解完一题自动保存进度，中断后重新运行会跳过已完成的题。
     model_choice: auto/reasoning/math；resume: True=读取进度续跑，False=从头开始。
-    math_model: 临时指定数学模型（如 deepseek-flash 省钱档），None=用 .env 的 MATH_MODEL。"""
+    math_model: 临时指定数学模型（如 deepseek-flash 省钱档），None=用 .env 的 MATH_MODEL。
+    should_stop: 可选回调，返回 True 时在当前题结束后停止（进度保留，可续跑）。"""
     def _report(msg):
         if progress_cb is not None:
             try:
@@ -1904,7 +1909,12 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
     graph_chat.update_state(config, {"messages":[]})
     if start_idx == 0:
         _report("共识别 " + str(len(q_list)) + " 道题，从头开始")
+    stopped = False
     for idx in range(start_idx, len(q_list)):
+        if should_stop is not None and should_stop():
+            stopped = True
+            _report(f"⏹ 已请求停止：已完成 {idx}/{len(q_list)} 题，进度已保存，可稍后续跑")
+            break
         q = q_list[idx]
         _report("正在解答第 " + str(idx+1) + "/" + str(len(q_list)) + " 题：" + q[:30] + "...")
         print("\n====批量处理第" + str(idx+1) + "题====\n题目：" + q[:80])
@@ -1944,7 +1954,7 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
 
     # —— 自动重做错题（第二遍）——
     retry_fixed = []
-    if fail_count > 0:
+    if fail_count > 0 and not stopped:
         _report("检测到" + str(fail_count) + "道失败题，开始自动重做（第二遍，每题最多重试3次）...")
         graph_chat.update_state(config, {"messages": []})
         for it in all_out_items:
@@ -2063,11 +2073,13 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
     docx_save = Path(OUTPUT_FOLDER) / f"{Path(filename).stem}_result.docx"
     doc.save(str(docx_save))
     print("批量解答保存docx：" + str(docx_save.resolve()))
-    try:
-        if progress_file.exists():
-            progress_file.unlink()
-    except Exception:
-        pass
+    # 中途被停止时保留进度文件，下次运行可续跑；跑完才清理
+    if not stopped:
+        try:
+            if progress_file.exists():
+                progress_file.unlink()
+        except Exception:
+            pass
 
     # 返回纯文本，用于后续生成pdf
     full_text_buf = []
@@ -2190,7 +2202,7 @@ def _safe_json_loads(s: str):
         return None
 
 
-def research_workflow(only_files=None, progress_cb=None, model_choice="auto"):
+def research_workflow(only_files=None, progress_cb=None, model_choice="auto", should_stop=None):
     """教研汇总：从 raw_exam_files 提取题目并做教研分析。
     model_choice: auto/reasoning/math，控制题目提取和教研分析使用的模型"""
     def _report(msg):
@@ -2212,11 +2224,17 @@ def research_workflow(only_files=None, progress_cb=None, model_choice="auto"):
     _report(f"读取到 {len(file_list)} 份试卷")
     all_research_items = []
     for fname,full_text in file_list:
+        if should_stop is not None and should_stop():
+            _report("⏹ 已停止教研（已分析部分会保留）")
+            break
         _report(f"\n【{fname}】开始处理")
         chunks = re.split(r"\n{3,}",full_text)
         valid_chunks = [c.strip() for c in chunks if len(c.strip())>=80]
         _report(f"【{fname}】共 {len(valid_chunks)} 个有效片段")
         for ci, ck in enumerate(valid_chunks):
+            if should_stop is not None and should_stop():
+                _report("⏹ 已停止教研（已分析部分会保留）")
+                break
             _report(f"【{fname}】正在分析第 {ci+1}/{len(valid_chunks)} 段...")
             try:
                 resp_ext = research_llm.invoke([{"role":"user","content":EXTRACT_PROMPT.format(text_chunk=ck)}])
@@ -2453,7 +2471,8 @@ FINE_CONTINUE_RULES = r"""【数学符号书写规则】一律使用 Unicode 纯
 【内容要求】题型部分每道题给出【完整题面 + 分步解析 + 最终答案】；中档题（B/C级）具体详细；拔高题（D级）以高考真题题型为主并标注考法与年份。直接输出正文，不要额外解释。【字数要求 - 必须遵守】你本次负责的 4 个板块合计至少 2000 字，题型板块（含题目与解析）务必展开写满，宁可详实不可简略；每个板块都要有实质内容，禁止只用一行带过。
 【去AI味·教师口吻】用老师讲课的口吻，直接、明确、有主次；禁用套话连接词（首先/其次/此外/值得注意的是/综上所述）；禁用"不是A而是B"等强行洞察句；不写空泛形容词堆砌；结尾不强行升华；例题先说"为什么这样想"再给步骤；允许自然教学习惯语（注意/这里容易错）；去AI味绝不牺牲公式定理与步骤的准确性。"""
 
-def generate_fine_content(subject="数学", topic="函数单调性", model_choice="auto", progress_cb=None):
+def generate_fine_content(subject="数学", topic="函数单调性", model_choice="auto", progress_cb=None,
+                          should_stop=None):
     """生成单个专题的精细化内容（Markdown 文本）。分段生成以突破单次输出长度限制，
     拼接时按板块编号去重，保证每个板块只出现一次。
     返回 (markdown文本, 模型显示名, 错误信息)"""
@@ -2471,6 +2490,8 @@ def generate_fine_content(subject="数学", topic="函数单调性", model_choic
     parts = []
     total = 0
     for bi, batch in enumerate(batches):
+        if should_stop is not None and should_stop():
+            return "", label, "已请求停止，本次讲义未生成（不会占用版本号）"
         template_lines = "\n".join(f"【{s}】" for s in batch)
         if bi == 0:
             prompt = FINE_PROMPT_TEMPLATE.format(subject=subject, topic=topic, template=template_lines)
@@ -2904,7 +2925,8 @@ def fine_compare(subject, topic, va, vb, out_folder=None):
     return "\n".join(lines), docx_a, docx_b
 
 
-def fine_generate_and_save(subject, topic, model_choice="auto", out_folder=None, progress_cb=None):
+def fine_generate_and_save(subject, topic, model_choice="auto", out_folder=None, progress_cb=None,
+                           should_stop=None):
     """精细化生成并保存 Word。每次生成都是新版本（v1/v2/…），不覆盖旧稿。
     返回 (成功标志, 提示信息, 文件路径)"""
     if out_folder is None:
@@ -2912,7 +2934,7 @@ def fine_generate_and_save(subject, topic, model_choice="auto", out_folder=None,
     out_folder = Path(out_folder)
     out_folder.mkdir(parents=True, exist_ok=True)
 
-    md_text, label, err = generate_fine_content(subject, topic, model_choice, progress_cb)
+    md_text, label, err = generate_fine_content(subject, topic, model_choice, progress_cb, should_stop)
     if err:
         return False, f"❌ 生成失败：{err}", None
 
@@ -3021,7 +3043,8 @@ def grade_one(question, standard, student, model_choice="math"):
             str(data.get("comment", "") or ""), knowledge)
 
 
-def grade_student_file(paper_filename, student_text, model_choice="math", progress_cb=None):
+def grade_student_file(paper_filename, student_text, model_choice="math", progress_cb=None,
+                       should_stop=None):
     """按题号对齐标准答案与学生答案并逐题判分；结果落盘供学情画像聚合。
     返回 (报告 markdown, 表格行, 总分, 满分, 错误信息)"""
     stem = Path(paper_filename).stem
@@ -3040,6 +3063,9 @@ def grade_student_file(paper_filename, student_text, model_choice="math", progre
     cb = progress_cb or (lambda m: None)
     rows, total, total_max = [], 0.0, 0.0
     for it in items:
+        if should_stop is not None and should_stop():
+            cb("⏹ 已请求停止判分，保留已判题目的结果")
+            break
         no = it.get("no")
         stu = students.get(int(no)) if no is not None else None
         cb(f"判分第 {no} 题……")

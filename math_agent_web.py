@@ -37,6 +37,32 @@ if maa._MATH_PROVIDER == "deepseek":
 elif maa._MATH_PROVIDER == "siliconflow":
     _MATH_TIERS.append(("省钱（Qwen2.5-7B-Instruct）", "Qwen/Qwen2.5-7B-Instruct"))
 
+# ==================== 长任务协作式停止 ====================
+_CANCEL = {"batch": False, "grade": False, "research": False, "fine": False, "wiki": False}
+
+
+def _reset_cancel(key):
+    _CANCEL[key] = False
+
+
+def _should_stop(key):
+    return bool(_CANCEL.get(key, False))
+
+
+def _make_stop(key, label):
+    def _stop():
+        _CANCEL[key] = True
+        return f"⏹ 已收到停止请求：{label}将在当前这一步结束后停下，已完成的结果会保留。"
+    _stop.__name__ = f"stop_{key}"
+    return _stop
+
+
+stop_batch = _make_stop("batch", "批量做题")
+stop_grade = _make_stop("grade", "判分")
+stop_research = _make_stop("research", "真题教研")
+stop_fine = _make_stop("fine", "讲义生成")
+stop_wiki = _make_stop("wiki", "Wiki 编译")
+
 # 界面文案按 .env 实际配置动态生成，避免"写着本地 Ollama、实际走云端 API"的误导
 _LOCAL_LLM = os.getenv("LLM_MODEL", "deepseek-r1:14b")
 _FAST_LLM = os.getenv("FAST_MODEL", "qwen2.5:7b")
@@ -165,6 +191,7 @@ def _wiki_status():
 
 def run_build_wiki(model_choice="auto"):
     yield "⏳ Wiki 编译启动中（按资料量数分钟到数十分钟），实时进度如下：\n", None
+    _reset_cancel("wiki")
     progress = []
     done = threading.Event()
     result = {}
@@ -173,7 +200,8 @@ def run_build_wiki(model_choice="auto"):
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
-                maa.build_wiki(progress_cb=progress.append, model_choice=model_choice)
+                maa.build_wiki(progress_cb=progress.append, model_choice=model_choice,
+                               should_stop=lambda: _should_stop("wiki"))
         except Exception as e:
             progress.append(f"[错误] {e}")
         finally:
@@ -275,6 +303,7 @@ def run_batch(files, model_choice="auto", math_model=""):
         yield "请先选择试卷文件。", None, None
         return
     tier = math_model or "标准"
+    _reset_cancel("batch")
     yield f"⏳ 批量做题启动中（模型档位：{tier}，每题约需数分钟），下方实时显示进度...\n", None, None
     progress = []
     done = threading.Event()
@@ -289,7 +318,8 @@ def run_batch(files, model_choice="auto", math_model=""):
                     progress.append(f"=== 开始处理文件：{fname} ===")
                     full_text, docx_path = maa.batch_solve_file(
                         fname, progress_cb=progress.append, model_choice=model_choice,
-                        math_model=(math_model or None))
+                        math_model=(math_model or None),
+                        should_stop=lambda: _should_stop("batch"))
                     pdf_path = OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")
                     maa.text_to_pdf(full_text, str(pdf_path))
                     st = dict(maa.LAST_BATCH_STATS or {})
@@ -357,6 +387,7 @@ def run_research(files, model_choice="auto"):
         yield "请先选择要教研的真题文件。", None
         return
     yield "⏳ 教研启动中（每题约需数分钟，全程可能 1~4 小时），下方会实时显示进度...\n", None
+    _reset_cancel("research")
     progress = []
     done = threading.Event()
     result = {}
@@ -367,7 +398,8 @@ def run_research(files, model_choice="auto"):
             with redirect_stdout(buf):
                 maa.research_workflow(only_files=list(files),
                                       progress_cb=progress.append,
-                                      model_choice=model_choice)
+                                      model_choice=model_choice,
+                                      should_stop=lambda: _should_stop("research"))
         except Exception as e:
             progress.append(f"[错误] {e}")
         finally:
@@ -459,6 +491,7 @@ def run_fine(subject, category, topic, model_choice):
         yield "请选择专题。", None
         return
     yield f"⏳ 正在生成「{subject} · {topic}」精细化内容（模型：{model_choice}），约 1~3 分钟，请耐心等待...\n", None
+    _reset_cancel("fine")
     progress = []
     done = threading.Event()
     result = {}
@@ -467,7 +500,8 @@ def run_fine(subject, category, topic, model_choice):
         ok, msg, path = maa.fine_generate_and_save(
             subject, topic, model_choice,
             out_folder=Path(maa.OUT_RESEARCH_FOLDER) / "精细化内容",
-            progress_cb=progress.append)
+            progress_cb=progress.append,
+            should_stop=lambda: _should_stop("fine"))
         result["ok"], result["msg"], result["path"] = ok, msg, path
         done.set()
 
@@ -781,6 +815,7 @@ def run_grade(paper, student_file, model_choice):
         yield "请上传学生答案文件（按「1. … 2. …」编号）。", None, None
         return
     yield "⏳ 正在判分（每题一次模型调用），请稍候……", None, None
+    _reset_cancel("grade")
     try:
         text = maa.read_batch_file(Path(student_file.name))
     except Exception as e:
@@ -792,7 +827,8 @@ def run_grade(paper, student_file, model_choice):
     def worker():
         try:
             md, rows, total, total_max, err = maa.grade_student_file(
-                paper, text, model_choice=model_choice, progress_cb=progress.append)
+                paper, text, model_choice=model_choice, progress_cb=progress.append,
+                should_stop=lambda: _should_stop("grade"))
             result.update({"md": md, "rows": rows, "total": total,
                            "max": total_max, "err": err})
         except Exception as e:
@@ -939,6 +975,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                 batch_tier = gr.Dropdown(label="模型档位", scale=1, choices=_MATH_TIERS, value="")
                 btn_refresh_b = gr.Button("刷新", scale=1, min_width=90)
                 btn_batch = gr.Button("开始批量做题", variant="primary", scale=1)
+                btn_stop_b = gr.Button("⏹ 停止", scale=1, min_width=90)
             batch_upload = gr.File(label="上传试卷到 batch_input（txt/md/docx/pdf）", file_count="multiple")
             batch_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
             batch_log = gr.Textbox(label="处理日志", lines=10, interactive=False)
@@ -955,6 +992,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                         label="判分模型", scale=3, value="math",
                         choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning")])
                     btn_grade = gr.Button("开始判分", variant="primary", scale=1)
+                    btn_stop_g = gr.Button("⏹ 停止", scale=1, min_width=90)
                 grade_log = gr.Textbox(label="判分日志", lines=6, interactive=False)
                 grade_table = gr.Dataframe(
                     label="逐题得分", interactive=False, wrap=True,
@@ -968,6 +1006,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
             btn_grade.click(run_grade, inputs=[batch_file, student_file, grade_model],
                             outputs=[grade_log, grade_table, grade_dl],
                             concurrency_id="grade", concurrency_limit=1)
+            btn_stop_b.click(stop_batch, outputs=[batch_log], concurrency_id="stop")
+            btn_stop_g.click(stop_grade, outputs=[grade_log], concurrency_id="stop")
 
         # ========== ④ 真题教研 ==========
         with gr.Tab("④ 真题教研"):
@@ -985,6 +1025,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                              (_MATH_LABEL, "math")])
                 btn_refresh_e = gr.Button("刷新", scale=1, min_width=90)
                 btn_research = gr.Button("开始真题教研", variant="primary", scale=1)
+                btn_stop_r = gr.Button("⏹ 停止", scale=1, min_width=90)
             exam_upload = gr.File(label="上传真题到 raw_exam_files（pdf/docx）", file_count="multiple")
             exam_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
             exam_log = gr.Textbox(label="教研日志", lines=10, interactive=False)
@@ -994,6 +1035,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
             btn_research.click(run_research, inputs=[exam_file, research_model],
                                outputs=[exam_log, exam_dl],
                                concurrency_id="research", concurrency_limit=1)
+            btn_stop_r.click(stop_research, outputs=[exam_log], concurrency_id="stop")
 
         # ========== ⑤ 精细化讲义 ==========
         with gr.Tab("⑤ 精细化讲义"):
@@ -1011,6 +1053,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                     label="生成模型", scale=3, value="math",
                     choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning"), ("自动", "auto")])
                 btn_fine = gr.Button("生成讲义", variant="primary", scale=1)
+                btn_stop_f = gr.Button("⏹ 停止", scale=1, min_width=90)
             fine_log = gr.Textbox(label="生成日志", lines=14, interactive=False)
             fine_dl = gr.File(label="下载 Word 讲义")
             with gr.Accordion("🕘 历史版本与对比（同专题重复生成保留 v1 / v2 / …，不覆盖旧稿）", open=False):
@@ -1038,6 +1081,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
             btn_fine.click(run_fine, inputs=[fine_subject, fine_category, fine_topic, fine_model],
                            outputs=[fine_log, fine_dl],
                            concurrency_id="fine", concurrency_limit=1)
+            btn_stop_f.click(stop_fine, outputs=[fine_log], concurrency_id="stop")
 
         # ========== ⑥ 知识库 ==========
         with gr.Tab("⑥ 知识库"):
@@ -1056,6 +1100,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                              (_REASON_LABEL, "reasoning"),
                              (_MATH_LABEL, "math")])
                 btn_wiki_build = gr.Button("编译 Wiki", variant="primary", scale=1)
+                btn_stop_w = gr.Button("⏹ 停止", scale=1, min_width=90)
                 btn_wiki_lint = gr.Button("自检", scale=1)
                 btn_wiki_heal = gr.Button("修复断链", scale=1)
             kb_log = gr.Textbox(label="日志", lines=12, interactive=False)
@@ -1067,6 +1112,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
             btn_wiki_lint.click(run_wiki_lint, outputs=[kb_log])
             btn_wiki_heal.click(run_wiki_heal, outputs=[kb_log, wiki_status])
             btn_build_legacy.click(build_kb, outputs=[kb_log])
+            btn_stop_w.click(stop_wiki, outputs=[kb_log], concurrency_id="stop")
 
         # ========== ⑦ 学情画像 ==========
         with gr.Tab("⑦ 学情画像"):
