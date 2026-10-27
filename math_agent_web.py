@@ -29,6 +29,22 @@ RAW_EXAM_FOLDER = Path(maa.RAW_EXAM_FOLDER)
 BATCH_INPUT_FOLDER = Path(maa.BATCH_INPUT_FOLDER)
 ALLOWED_BATCH = (".txt", ".md", ".docx", ".pdf")
 
+# 界面文案按 .env 实际配置动态生成，避免"写着本地 Ollama、实际走云端 API"的误导
+_LOCAL_LLM = os.getenv("LLM_MODEL", "deepseek-r1:14b")
+_FAST_LLM = os.getenv("FAST_MODEL", "qwen2.5:7b")
+_REASON_LABEL = f"推理模型（本地 {_LOCAL_LLM}）"
+if maa._MATH_PROVIDER in ("deepseek", "siliconflow"):
+    _MATH_LABEL = f"数学模型（云端 {maa._MATH_PROVIDER}: {maa._MATH_MODEL_NAME}）"
+    _ENGINE_DESC = (
+        f"推理走本地 Ollama（{_LOCAL_LLM} + {_FAST_LLM}），"
+        f"数学计算走云端 {maa._MATH_PROVIDER} API（{maa._MATH_MODEL_NAME}）。"
+        f"简单题约 1 分钟，大题约 1~5 分钟。")
+else:
+    _MATH_LABEL = f"数学模型（本地 {maa._MATH_MODEL_NAME}）"
+    _ENGINE_DESC = (
+        f"全部本地 Ollama 驱动（{_LOCAL_LLM} + {_FAST_LLM} + {maa._MATH_MODEL_NAME}）。"
+        f"简单题约 1 分钟，大题约 3~8 分钟。")
+
 
 def _run_with_console(fn, *args, **kwargs):
     """运行函数并捕获其 print 输出，返回 (输出文本, 函数返回值)"""
@@ -65,7 +81,7 @@ _WEB_THREAD = "web_chat"
 def clear_memory():
     try:
         maa.graph_chat.update_state(
-            {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": 10},
+            {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": maa._RECURSION_LIMIT},
             {"messages": []})
         return "✅ 记忆已清空，开始全新对话"
     except Exception as e:
@@ -75,9 +91,9 @@ def solve_one(question, model_choice):
     if not question or not question.strip():
         yield "请输入题目。", None
         return
-    model_label = {"auto": "自动（按题型）", "reasoning": "DeepSeek推理", "math": "Qwen数学"}.get(model_choice, model_choice)
+    model_label = {"auto": "自动（按题型）", "reasoning": _REASON_LABEL, "math": _MATH_LABEL}.get(model_choice, model_choice)
     yield f"⏳ 正在解题中（模型：{model_label}，简单题约1分钟，大题约3~5分钟），请勿关闭页面，耐心等待...", None
-    cfg = {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": 10}
+    cfg = {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": maa._RECURSION_LIMIT}
     plot = OUTPUT_FOLDER / "plot_out.png"
     before = plot.stat().st_mtime if plot.exists() else None
     t0 = time.time()
@@ -87,7 +103,12 @@ def solve_one(question, model_choice):
         emsg = str(e)
         elow = emsg.lower()
         if any(k in elow for k in ["401", "403", "authentication", "invalid api key", "余额", "insufficient", "402"]):
-            hint = "API 密钥无效或余额不足。请到 https://siliconflow.cn/account/fee 查看余额并充值，或在 .env 检查 SILICONFLOW_API_KEY。"
+            if maa._MATH_PROVIDER == "deepseek":
+                hint = "API 密钥无效或余额不足。请到 https://platform.deepseek.com/usage 查看余额，或在 .env 检查 DEEPSEEK_API_KEY。"
+            else:
+                hint = "API 密钥无效或余额不足。请到 https://siliconflow.cn/account/fee 查看余额并充值，或在 .env 检查 SILICONFLOW_API_KEY。"
+        elif "预算" in emsg or "DAILY_BUDGET" in emsg:
+            hint = emsg
         elif any(k in elow for k in ["timeout", "timed out", "connection", "network", "连接", "超时"]):
             hint = "网络连接超时或中断。请检查网络后重试；若持续出现，可稍后再试。"
         elif any(k in elow for k in ["ollama", "connection refused", "拒绝连接"]):
@@ -476,10 +497,10 @@ def _run_archive_both(q, model):
 # ==================== 网页界面 ====================
 with gr.Blocks(title="高考数学一体化Agent · 网页版",
                theme=gr.themes.Soft()) as demo:
-    gr.Markdown("""
+    gr.Markdown(f"""
 # 🧮 高考数学一体化Agent · 网页操作版
-本地 Ollama（deepseek-r1:14b + qwen2.5:7b）驱动。注意：大题推理较慢（约 1~5 分钟/题），
-提交后请耐心等待页面返回；页面刷新后显示结果即为完成。
+{_ENGINE_DESC}
+大题推理较慢，提交后请耐心等待页面返回；页面刷新后显示结果即为完成。
 """)
 
     # ---------- 功能1 ----------
@@ -490,7 +511,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             model_choice = gr.Dropdown(
                 label="解题模型",
-                choices=[("自动（按题型切换）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                choices=[("自动（按题型切换）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
                 value="auto",
                 scale=2)
             btn_solve = gr.Button("开始解答", variant="primary", scale=1)
@@ -526,7 +547,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             wiki_model = gr.Dropdown(
                 label="编译模型",
-                choices=[("自动（快速模型）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                choices=[("自动（快速模型）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
                 value="auto", scale=2)
             btn_wiki_build = gr.Button("编译 Wiki 知识库", variant="primary", scale=1)
             btn_wiki_lint = gr.Button("Wiki 自检", scale=1)
@@ -551,7 +572,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             batch_model = gr.Dropdown(
                 label="解题模型",
-                choices=[("自动（按题型切换）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                choices=[("自动（按题型切换）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
                 value="auto", scale=2)
             btn_refresh_b = gr.Button("刷新列表", scale=1)
             btn_batch = gr.Button("开始批量做题", variant="primary", scale=1)
@@ -575,7 +596,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             research_model = gr.Dropdown(
                 label="分析模型",
-                choices=[("自动（推理模型）", "auto"), ("DeepSeek-R1 推理", "reasoning"), ("数学模型（API/本地）", "math")],
+                choices=[("自动（推理模型）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
                 value="auto", scale=2)
             btn_refresh_e = gr.Button("刷新列表", scale=1)
             btn_research = gr.Button("开始真题教研", variant="primary", scale=1)
@@ -608,7 +629,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             fine_model = gr.Dropdown(
                 label="生成模型",
-                choices=[("数学模型·DeepSeek-V3（推荐，云端）", "math"), ("DeepSeek-R1 推理", "reasoning"), ("自动（云端数学）", "auto")],
+                choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning"), ("自动", "auto")],
                 value="math", scale=2)
             btn_fine = gr.Button("开始生成精细化讲义", variant="primary", scale=1)
         fine_log = gr.Textbox(label="生成日志", lines=14, interactive=False)
@@ -657,7 +678,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         with gr.Row():
             archive_model = gr.Dropdown(
                 label="分析模型",
-                choices=[("数学模型·DeepSeek-V3（推荐）", "math"), ("DeepSeek-R1 推理", "reasoning"), ("自动", "auto")],
+                choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning"), ("自动", "auto")],
                 value="math", scale=2)
             btn_archive = gr.Button("① 生成题目档案", variant="primary", scale=1)
             btn_variant = gr.Button("② 命题人视角改造", variant="primary", scale=1)
