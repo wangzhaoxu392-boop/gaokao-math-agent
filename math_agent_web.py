@@ -1044,11 +1044,12 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
                         "自动导出 Word。学科 → 篇章 → 专题 三级联动。")
             with gr.Row():
                 fine_subject = gr.Dropdown(label="学科", choices=fine_subjects(), value="数学", scale=1)
-                fine_category = gr.Dropdown(label="篇章", choices=fine_categories("数学"), value=None, scale=1)
+                fine_category = gr.Dropdown(label="篇章", choices=fine_categories("数学"), value=None,
+                                            scale=1, allow_custom_value=True)
                 fine_topic = gr.Dropdown(
                     label="专题",
                     choices=fine_topics("数学", list(maa.FINE_TOPICS["数学"].keys())[0]),
-                    value=None, scale=2)
+                    value=None, scale=2, allow_custom_value=True)
             with gr.Row():
                 fine_model = gr.Dropdown(
                     label="生成模型", scale=3, value="math",

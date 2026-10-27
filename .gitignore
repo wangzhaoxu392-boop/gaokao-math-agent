@@ -57,3 +57,6 @@ api_usage.json
 
 _screenshot*.png
 _*.png
+
+# 格式转换产物
+output_md/
