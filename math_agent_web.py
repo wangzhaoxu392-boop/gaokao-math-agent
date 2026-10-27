@@ -29,6 +29,13 @@ RAW_EXAM_FOLDER = Path(maa.RAW_EXAM_FOLDER)
 BATCH_INPUT_FOLDER = Path(maa.BATCH_INPUT_FOLDER)
 ALLOWED_BATCH = (".txt", ".md", ".docx", ".pdf")
 
+# 批量做题的"模型档位"：只覆盖数学模型，推理模型不受影响
+_MATH_TIERS = [("标准（" + maa._MATH_MODEL_NAME + "）", "")]
+if maa._MATH_PROVIDER == "deepseek":
+    _MATH_TIERS.append(("省钱（deepseek-flash）", "deepseek-flash"))
+elif maa._MATH_PROVIDER == "siliconflow":
+    _MATH_TIERS.append(("省钱（Qwen2.5-7B-Instruct）", "Qwen/Qwen2.5-7B-Instruct"))
+
 # 界面文案按 .env 实际配置动态生成，避免"写着本地 Ollama、实际走云端 API"的误导
 _LOCAL_LLM = os.getenv("LLM_MODEL", "deepseek-r1:14b")
 _FAST_LLM = os.getenv("FAST_MODEL", "qwen2.5:7b")
@@ -89,10 +96,11 @@ def clear_memory():
 
 def solve_one(question, model_choice):
     if not question or not question.strip():
-        yield "请输入题目。", None
+        yield "请输入题目。", None, ""
         return
     model_label = {"auto": "自动（按题型）", "reasoning": _REASON_LABEL, "math": _MATH_LABEL}.get(model_choice, model_choice)
-    yield f"⏳ 正在解题中（模型：{model_label}，简单题约1分钟，大题约3~5分钟），请勿关闭页面，耐心等待...", None
+    yield (f"⏳ 正在解题中（模型：{model_label}，简单题约1分钟，大题约3~5分钟），"
+           f"请勿关闭页面，耐心等待...", None, "")
     cfg = {"configurable": {"thread_id": _WEB_THREAD}, "recursion_limit": maa._RECURSION_LIMIT}
     plot = OUTPUT_FOLDER / "plot_out.png"
     before = plot.stat().st_mtime if plot.exists() else None
@@ -115,12 +123,16 @@ def solve_one(question, model_choice):
             hint = "本地 Ollama 服务未启动。请先在终端运行 ollama serve 或启动 Ollama 应用。"
         else:
             hint = f"解题出错（{type(e).__name__}）：{emsg[:200]}"
-        yield f"❌ {hint}", None
+        yield f"❌ {hint}", None, ""
         return
     dt = time.time() - t0
     after = plot.stat().st_mtime if plot.exists() else None
     img = str(plot) if (after and after != before) else None
-    yield f"（本题用时 {dt:.0f} 秒，使用模型：{model_used}）\n\n{ans}", img
+    st = maa._LAST_RUN_STATS
+    stats = (f"⏱ 本题 {dt:.0f} 秒 · 模型 `{model_used}` · "
+             f"输入 {st.get('prompt', 0):,} / 输出 {st.get('completion', 0):,} token · "
+             f"约 ¥{st.get('cost', 0):.4f}")
+    yield f"（本题用时 {dt:.0f} 秒，使用模型：{model_used}）\n\n{ans}", img, stats
 
 
 # ==================== 功能2：LLM Wiki 知识库（Karpathy 改造） ====================
@@ -252,11 +264,12 @@ def upload_batch(files):
     return msg, gr.update(choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
 
 
-def run_batch(files, model_choice="auto"):
+def run_batch(files, model_choice="auto", math_model=""):
     if not files:
         yield "请先选择试卷文件。", None
         return
-    yield "⏳ 批量做题启动中（每题约需数分钟），下方实时显示进度...\n", None
+    tier = math_model or "标准"
+    yield f"⏳ 批量做题启动中（模型档位：{tier}，每题约需数分钟），下方实时显示进度...\n", None
     progress = []
     done = threading.Event()
     result = {}
@@ -268,7 +281,8 @@ def run_batch(files, model_choice="auto"):
                 for fname in files:
                     progress.append(f"=== 开始处理文件：{fname} ===")
                     full_text, docx_path = maa.batch_solve_file(
-                        fname, progress_cb=progress.append, model_choice=model_choice)
+                        fname, progress_cb=progress.append, model_choice=model_choice,
+                        math_model=(math_model or None))
                     pdf_path = OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")
                     maa.text_to_pdf(full_text, str(pdf_path))
                     progress.append(f"=== {fname} 完成，已生成 Word + PDF ===")
@@ -494,20 +508,177 @@ def _run_archive_both(q, model):
         return text + f"\n\n—— 分析模型：{label}\n（Word 导出失败：{type(e).__name__}: {str(e)[:100]}）", None
 
 
+# ==================== 用量看板（顶部仪表盘） ====================
+_BAL_CACHE = {"ts": 0.0, "data": (False, {})}
+
+
+def _balance_cached(max_age=300):
+    """余额查询带缓存，避免看板轮询把接口打爆（手动刷新会强制失效）"""
+    now = time.time()
+    if now - _BAL_CACHE["ts"] < max_age:
+        return _BAL_CACHE["data"]
+    try:
+        data = maa.api_balance_info()
+    except Exception as e:
+        data = (False, {"error": f"{type(e).__name__}: {str(e)[:60]}"})
+    _BAL_CACHE.update({"ts": now, "data": data})
+    return data
+
+
+def _num(n):
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _money(v):
+    try:
+        return f"¥{float(v):.2f}"
+    except (TypeError, ValueError):
+        return "¥—"
+
+
+_DASH_CSS = """
+<style>
+.dsh{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));
+     gap:10px;margin:4px 0 6px 0}
+.dsh .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;
+     padding:10px 13px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+.dsh .k{font-size:12px;color:#6b7280;letter-spacing:.3px}
+.dsh .v{font-size:20px;font-weight:650;color:#0f172a;margin-top:2px;
+     font-variant-numeric:tabular-nums}
+.dsh .s{font-size:11px;color:#9ca3af;margin-top:3px;line-height:1.45}
+.dsh .ok .v{color:#0f766e}
+.dsh .warn .v{color:#b45309}
+.dsh .bar{height:5px;background:#eef2f7;border-radius:99px;overflow:hidden;margin-top:6px}
+.dsh .bar span{display:block;height:100%;background:linear-gradient(90deg,#34d399,#f59e0b);border-radius:99px}
+.dsh .bar span.hi{background:linear-gradient(90deg,#f59e0b,#ef4444)}
+</style>
+"""
+
+
+def _dashboard_html():
+    s = maa.usage_snapshot()
+    ok, bal = _balance_cached()
+
+    # 余额卡
+    if ok:
+        bal_v = _money(bal.get("total"))
+        bal_s = f"充值 {_money(bal.get('topped'))} · 赠送 {_money(bal.get('granted'))}"
+        try:
+            remain_balance = float(bal.get("total"))
+        except (TypeError, ValueError):
+            remain_balance = None
+    elif bal.get("local"):
+        bal_v, bal_s, remain_balance = "本地模式", "不产生 API 费用", None
+    else:
+        bal_v, bal_s = "查询失败", (bal.get("error") or "点「刷新」重试")
+        remain_balance = None
+
+    # 今日预算卡
+    limit = s["daily_limit"]
+    spent = s["daily_cost"]
+    if limit > 0:
+        pct = max(0.0, min(100.0, spent / limit * 100))
+        bar_cls = "hi" if pct >= 80 else ""
+        bar = f'<div class="bar"><span class="{bar_cls}" style="width:{pct:.1f}%"></span></div>'
+        budget_v = f"{_money(spent)} / {_money(limit)}"
+        remain_budget = max(0.0, limit - spent)
+        budget_s = f"剩余 {_money(remain_budget)} · 今日 {s['daily_problems']} 题"
+        card_cls = "warn" if pct >= 80 else ""
+    else:
+        bar, budget_v = "", _money(spent)
+        remain_budget = None
+        budget_s = "未设每日上限（DAILY_BUDGET_CNY=0）"
+        card_cls = ""
+
+    # 还能跑多少题
+    caps = [x for x in (remain_budget, remain_balance) if x is not None]
+    remain = min(caps) if caps else None
+    avg = s["avg_cost"]
+    if remain is not None and avg > 0:
+        can_run = f"≈ {int(remain / avg)} 题"
+        can_s = f"按均价 {_money(avg)}/题 估算"
+    else:
+        can_run, can_s = "—", "需要云端 API 与历史用量"
+
+    cards = [
+        f'<div class="card ok"><div class="k">账户余额</div>'
+        f'<div class="v">{bal_v}</div><div class="s">{bal_s}</div></div>',
+        f'<div class="card {card_cls}"><div class="k">今日花费 / 预算</div>'
+        f'<div class="v">{budget_v}</div>{bar}<div class="s">{budget_s}</div></div>',
+        f'<div class="card"><div class="k">今日 token（输入/输出）</div>'
+        f'<div class="v">{_num(s["daily_prompt_tokens"])} / {_num(s["daily_completion_tokens"])}</div>'
+        f'<div class="s">累计 {_num(s["total_prompt_tokens"])} / {_num(s["total_completion_tokens"])}</div></div>',
+        f'<div class="card"><div class="k">累计解题</div>'
+        f'<div class="v">{_num(s["total_problems"])} 题</div>'
+        f'<div class="s">累计 {_money(s["total_cost"])} · 均价 {_money(avg)}</div></div>',
+        f'<div class="card"><div class="k">当前数学模型</div>'
+        f'<div class="v" style="font-size:15px">{s["model"]}</div>'
+        f'<div class="s">{s["provider"]} · 推理 {s["local_llm"]}（本地）</div></div>',
+        f'<div class="card"><div class="k">预计还能跑</div>'
+        f'<div class="v">{can_run}</div><div class="s">{can_s}</div></div>',
+    ]
+    return _DASH_CSS + '<div class="dsh">' + "".join(cards) + "</div>"
+
+
+def refresh_dashboard():
+    _BAL_CACHE["ts"] = 0.0
+    return _dashboard_html()
+
+
+def balance_detail():
+    _BAL_CACHE["ts"] = 0.0
+    try:
+        ok, msg = maa.query_siliconflow_balance()
+    except Exception as e:
+        msg = f"⚠️ 查询出错：{type(e).__name__}: {str(e)[:150]}"
+    return msg
+
+
+def export_answer(answer_text, question):
+    """把单题解答导出为 Word（复用项目的 MD→Word 转换）"""
+    text = (answer_text or "").strip()
+    if len(text) < 20:
+        return None
+    out_dir = OUTPUT_FOLDER / "单题解答"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = "解答_" + time.strftime("%Y%m%d_%H%M%S") + ".docx"
+    md = f"# 题目\n\n{(question or '').strip()}\n\n# 解答\n\n{text}\n"
+    try:
+        path, _info = maa.convert_md_to_docx(md, output_folder=str(out_dir), out_name=name)
+        return str(path)
+    except Exception:
+        return None
+
+
 # ==================== 网页界面 ====================
-with gr.Blocks(title="高考数学一体化Agent · 网页版",
-               theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
     gr.Markdown(f"""
 # 🧮 高考数学一体化Agent · 网页操作版
 {_ENGINE_DESC}
-大题推理较慢，提交后请耐心等待页面返回；页面刷新后显示结果即为完成。
 """)
+
+    # ---------- 顶部用量看板 ----------
+    dashboard = gr.HTML(_dashboard_html())
+    with gr.Row():
+        btn_refresh = gr.Button("🔄 刷新用量", scale=0, min_width=120)
+        btn_balance = gr.Button("📄 余额与用量明细", scale=0, min_width=170)
+    with gr.Accordion("用量明细（含 API 余额、累计 token、官网对账入口）", open=False):
+        usage_detail = gr.Textbox(label="", lines=9, interactive=False, buttons=["copy"])
+    btn_refresh.click(refresh_dashboard, outputs=[dashboard])
+    btn_balance.click(balance_detail, outputs=[usage_detail])
+    # 15 秒轮询看板（读本地统计，余额走 300 秒缓存，不会频繁打接口）
+    _timer = gr.Timer(15)
+    _timer.tick(_dashboard_html, outputs=[dashboard])
 
     # ---------- 功能1 ----------
     with gr.Tab("① 单题交互"):
         q_input = gr.Textbox(
-            label="输入题目（可含多小问，如“已知 f(x)=... (1)求... (2)证明...”），支持追问，如“那它的极值呢”",
-            lines=4, placeholder="例如：求函数 y = x^2 - 4x + 3 的单调区间和极值")
+            label="题目（可含多小问；支持追问，如“那它的极值呢”）",
+            lines=4, placeholder="例如：求函数 y = x^2 - 4x + 3 的单调区间和极值",
+            buttons=["copy"])
         with gr.Row():
             model_choice = gr.Dropdown(
                 label="解题模型",
@@ -516,19 +687,16 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
                 scale=2)
             btn_solve = gr.Button("开始解答", variant="primary", scale=1)
             btn_clear = gr.Button("清空记忆", scale=1)
-            btn_balance = gr.Button("查询API余额", scale=1)
-        out_text = gr.Textbox(label="解答结果", lines=20, interactive=False)
-        balance_text = gr.Textbox(label="API余额与用量", lines=6, interactive=False, visible=True)
+        run_stats = gr.Markdown("")
+        out_text = gr.Textbox(label="解答结果", lines=18, interactive=False, buttons=["copy"])
+        with gr.Row():
+            btn_export = gr.Button("📄 导出 Word", scale=1, min_width=120)
+            export_file = gr.File(label="下载 Word 文档", scale=3)
         out_plot = gr.Image(label="函数图像（如有）", type="filepath", visible=True)
-        btn_solve.click(solve_one, inputs=[q_input, model_choice], outputs=[out_text, out_plot])
+        btn_solve.click(solve_one, inputs=[q_input, model_choice],
+                        outputs=[out_text, out_plot, run_stats])
         btn_clear.click(clear_memory, outputs=[out_text])
-        def _check_balance():
-            try:
-                ok, msg = maa.query_siliconflow_balance()
-                return msg
-            except Exception as e:
-                return f"⚠️ 查询出错：{type(e).__name__}: {str(e)[:200]}\n请手动查看：https://siliconflow.cn/account/fee"
-        btn_balance.click(_check_balance, outputs=[balance_text])
+        btn_export.click(export_answer, inputs=[out_text, q_input], outputs=[export_file])
 
     # ---------- 功能2 ----------
     with gr.Tab("② LLM Wiki 知识库"):
@@ -565,6 +733,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
 
     # ---------- 功能3 ----------
     with gr.Tab("③ 批量做题"):
+        gr.Markdown("余额有限时，把「模型档位」切到「省钱」可显著降低整卷成本（标准档更稳、更贵）。")
         batch_file = gr.Dropdown(
             label="选择 batch_input 中的试卷（可多选，一次处理多份）",
             multiselect=True,
@@ -574,6 +743,9 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
                 label="解题模型",
                 choices=[("自动（按题型切换）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
                 value="auto", scale=2)
+            batch_tier = gr.Dropdown(
+                label="模型档位",
+                choices=_MATH_TIERS, value="", scale=1)
             btn_refresh_b = gr.Button("刷新列表", scale=1)
             btn_batch = gr.Button("开始批量做题", variant="primary", scale=1)
         batch_upload = gr.File(
@@ -584,7 +756,7 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版",
         batch_upload.upload(upload_batch, inputs=[batch_upload],
                             outputs=[batch_msg, batch_file])
         btn_refresh_b.click(refresh_batch, outputs=[batch_file])
-        btn_batch.click(run_batch, inputs=[batch_file, batch_model],
+        btn_batch.click(run_batch, inputs=[batch_file, batch_model, batch_tier],
                         outputs=[batch_log, batch_dl])
 
     # ---------- 功能4 ----------
@@ -695,4 +867,5 @@ if __name__ == "__main__":
     # 并发设为 1，避免与本地 Ollama 单实例推理冲突
     # inbrowser=False：避免和启动脚本自动打开浏览器冲突（否则会开两个网页）
     demo.queue(default_concurrency_limit=1).launch(
-        server_name="127.0.0.1", server_port=7860, inbrowser=False)
+        server_name="127.0.0.1", server_port=7860, inbrowser=False,
+        theme=gr.themes.Soft())

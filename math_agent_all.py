@@ -41,6 +41,7 @@ for p in [CHROMA_DB_PATH, KNOWLEDGE_FOLDER, BATCH_INPUT_FOLDER, OUTPUT_FOLDER, R
 class SolveState(MessagesState):
     model_choice: str   # "auto" / "reasoning" / "math"
     model_used: str     # 实际使用的模型名称（用于输出标注）
+    math_model: str     # 本次指定的数学模型名（空=用 .env 的 MATH_MODEL，批量做题可切省钱档）
 
 # 运行参数统一从 .env 读取（此前 TIMEOUT / MAX_TOKENS 写了却不生效）
 _NUM_CTX = int(os.getenv("NUM_CTX", "8192") or 8192)          # 上下文窗口：默认 4096 会把长题/知识库截断
@@ -71,54 +72,67 @@ llm_fast = ChatOllama(
 # 【启动提速】延迟创建：首次使用数学模型时才导入 langchain_openai（该库导入约1秒），加快网页版启动
 _MATH_PROVIDER = os.getenv("MATH_PROVIDER", "ollama").lower()
 _MATH_MODEL_NAME = os.getenv("MATH_MODEL", "qwen2.5:14b")
+_MATH_MAX_TOKENS = int(os.getenv("MATH_MAX_TOKENS", "3072") or 3072)
 llm_math = None
 llm_math_with_tools = None
+# 按模型名缓存：批量做题可临时切到省钱模型（如 deepseek-flash），不用重建进程
+_MATH_LLM_CACHE = {}
+_MATH_LLM_TOOLS_CACHE = {}
 
 
-def _ensure_llm_math():
-    """延迟创建数学模型（首次调用才创建并导入对应库）"""
+def _ensure_llm_math(model_name=None):
+    """延迟创建数学模型（首次调用才创建并导入对应库）；同名模型复用缓存"""
     global llm_math
-    if llm_math is None:
-        if _MATH_PROVIDER in ("siliconflow", "deepseek"):
-            from langchain_openai import ChatOpenAI
-            if _MATH_PROVIDER == "deepseek":
-                llm_math = ChatOpenAI(
-                    model=_MATH_MODEL_NAME,
-                    api_key=os.getenv("DEEPSEEK_API_KEY", ""),
-                    base_url="https://api.deepseek.com",
-                    temperature=0.1,
-                    max_tokens=3072,
-                    timeout=120
-                )
-                print(f"[模型] 数学模型使用 DeepSeek 官方 API: {_MATH_MODEL_NAME}")
-            else:
-                llm_math = ChatOpenAI(
-                    model=_MATH_MODEL_NAME,
-                    api_key=os.getenv("SILICONFLOW_API_KEY", ""),
-                    base_url="https://api.siliconflow.cn/v1",
-                    temperature=0.1,
-                    max_tokens=3072,
-                    timeout=120
-                )
-                print(f"[模型] 数学模型使用硅基流动 API: {_MATH_MODEL_NAME}")
-        else:
-            llm_math = ChatOllama(
-                base_url=os.getenv("OLLAMA_BASE_URL"),
-                model=_MATH_MODEL_NAME,
+    name = (model_name or "").strip() or _MATH_MODEL_NAME
+    if name in _MATH_LLM_CACHE:
+        return _MATH_LLM_CACHE[name]
+    if _MATH_PROVIDER in ("siliconflow", "deepseek"):
+        from langchain_openai import ChatOpenAI
+        if _MATH_PROVIDER == "deepseek":
+            obj = ChatOpenAI(
+                model=name,
+                api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+                base_url="https://api.deepseek.com",
                 temperature=0.1,
-                num_predict=3072,
-                timeout=900
+                max_tokens=_MATH_MAX_TOKENS,
+                timeout=120
             )
-            print(f"[模型] 数学模型使用本地 Ollama: {_MATH_MODEL_NAME}")
-    return llm_math
+            print(f"[模型] 数学模型使用 DeepSeek 官方 API: {name}")
+        else:
+            obj = ChatOpenAI(
+                model=name,
+                api_key=os.getenv("SILICONFLOW_API_KEY", ""),
+                base_url="https://api.siliconflow.cn/v1",
+                temperature=0.1,
+                max_tokens=_MATH_MAX_TOKENS,
+                timeout=120
+            )
+            print(f"[模型] 数学模型使用硅基流动 API: {name}")
+    else:
+        obj = ChatOllama(
+            base_url=os.getenv("OLLAMA_BASE_URL"),
+            model=name,
+            temperature=0.1,
+            num_predict=_MATH_MAX_TOKENS,
+            num_ctx=_NUM_CTX,
+            timeout=_TIMEOUT
+        )
+        print(f"[模型] 数学模型使用本地 Ollama: {name}")
+    _MATH_LLM_CACHE[name] = obj
+    if name == _MATH_MODEL_NAME:
+        llm_math = obj
+    return obj
 
 
-def _ensure_llm_math_with_tools():
+def _ensure_llm_math_with_tools(model_name=None):
     """延迟创建带工具绑定的数学模型（tools 在模块中定义后调用）"""
     global llm_math_with_tools
-    if llm_math_with_tools is None:
-        llm_math_with_tools = _ensure_llm_math().bind_tools(tools)
-    return llm_math_with_tools
+    name = (model_name or "").strip() or _MATH_MODEL_NAME
+    if name not in _MATH_LLM_TOOLS_CACHE:
+        _MATH_LLM_TOOLS_CACHE[name] = _ensure_llm_math(name).bind_tools(tools)
+        if name == _MATH_MODEL_NAME:
+            llm_math_with_tools = _MATH_LLM_TOOLS_CACHE[name]
+    return _MATH_LLM_TOOLS_CACHE[name]
 
 CATEGORY_LIST = ["集合", "函数", "导数", "三角", "数列", "立体几何", "圆锥曲线", "概率统计"]
 
@@ -161,11 +175,49 @@ def record_api_usage(prompt_tokens=0, completion_tokens=0, estimated_cost=None):
     # 当日花费（用于预算护栏与"今日已花"展示），跨天自动归零
     daily = data.get("daily") or {}
     if daily.get("date") != _today():
-        daily = {"date": _today(), "cost": 0.0, "problems": 0}
+        daily = {"date": _today(), "cost": 0.0, "problems": 0,
+                 "prompt_tokens": 0, "completion_tokens": 0}
     daily["cost"] = round(float(daily.get("cost") or 0.0) + estimated_cost, 4)
     daily["problems"] = int(daily.get("problems") or 0) + 1
+    daily["prompt_tokens"] = int(daily.get("prompt_tokens") or 0) + int(prompt_tokens or 0)
+    daily["completion_tokens"] = int(daily.get("completion_tokens") or 0) + int(completion_tokens or 0)
     data["daily"] = daily
     _save_usage(data)
+    return round(float(estimated_cost or 0.0), 4)
+
+
+def usage_snapshot():
+    """给网页看板用的用量快照（只读本地统计，不联网）"""
+    u = _load_usage()
+    daily = u.get("daily") or {}
+    is_today = daily.get("date") == _today()
+    limit = _budget_limit()
+    spent = _daily_cost(u)
+    total_problems = int(u.get("api_problems_solved") or 0)
+    total_cost = float(u.get("estimated_cost_cny") or 0.0)
+    avg_cost = (total_cost / total_problems) if total_problems else 0.0
+    return {
+        "provider": _MATH_PROVIDER,
+        "model": _MATH_MODEL_NAME,
+        "local_llm": os.getenv("LLM_MODEL", ""),
+        "fast_llm": os.getenv("FAST_MODEL", ""),
+        "daily_cost": round(spent, 4),
+        "daily_limit": limit,
+        "daily_problems": int(daily.get("problems") or 0) if is_today else 0,
+        "daily_prompt_tokens": int(daily.get("prompt_tokens") or 0) if is_today else 0,
+        "daily_completion_tokens": int(daily.get("completion_tokens") or 0) if is_today else 0,
+        "total_problems": total_problems,
+        "total_cost": round(total_cost, 4),
+        "total_prompt_tokens": int(u.get("prompt_tokens") or 0),
+        "total_completion_tokens": int(u.get("completion_tokens") or 0),
+        "avg_cost": round(avg_cost, 4),
+        "last_run": dict(_LAST_RUN_STATS),
+    }
+
+
+# 单次解题的消耗（网页端"本题用量"用）
+_LAST_RUN_STATS = {"prompt": 0, "completion": 0, "cost": 0.0, "seconds": 0.0}
+
 
 
 # 单次解题期间的 token 累计（由各节点写入，run_question 结算）
@@ -226,6 +278,53 @@ def check_api_budget():
             f"可在 .env 调大 DAILY_BUDGET_CNY（设为 0 关闭限制），"
             f"或把 MATH_PROVIDER 改成 ollama 用本地模型免费跑。")
     return True, ""
+
+def api_balance_info():
+    """查询账户余额并归一化字段，供网页看板使用。
+    返回 (ok, dict)：total / topped / granted / available / currency / provider / error"""
+    if _MATH_PROVIDER == "ollama":
+        return False, {"local": True, "error": "本地模型模式，不计费"}
+    if _MATH_PROVIDER == "deepseek":
+        key = os.getenv("DEEPSEEK_API_KEY", "")
+        if not key:
+            return False, {"error": "未配置 DEEPSEEK_API_KEY"}
+        try:
+            r = requests.get("https://api.deepseek.com/user/balance",
+                             headers={"Authorization": f"Bearer {key}"}, timeout=6)
+            if r.status_code != 200:
+                return False, {"error": f"HTTP {r.status_code}", "provider": "deepseek"}
+            d = r.json()
+            bi = (d.get("balance_infos") or [{}])[0]
+            return True, {
+                "provider": "deepseek",
+                "total": bi.get("total_balance"),
+                "topped": bi.get("topped_up_balance"),
+                "granted": bi.get("granted_balance"),
+                "available": d.get("is_available"),
+                "currency": bi.get("currency", "CNY"),
+            }
+        except Exception as e:
+            return False, {"error": str(e)[:80], "provider": "deepseek"}
+    key = os.getenv("SILICONFLOW_API_KEY", "")
+    if not key:
+        return False, {"error": "未配置 SILICONFLOW_API_KEY", "provider": "siliconflow"}
+    try:
+        r = requests.get("https://api.siliconflow.com/v1/user/info",
+                         headers={"Authorization": f"Bearer {key}"}, timeout=6)
+        if r.status_code != 200:
+            return False, {"error": f"HTTP {r.status_code}", "provider": "siliconflow"}
+        d = r.json().get("data", {})
+        return True, {
+            "provider": "siliconflow",
+            "total": d.get("totalBalance"),
+            "topped": d.get("chargeBalance"),
+            "granted": d.get("balance"),
+            "available": d.get("status"),
+            "currency": "CNY",
+        }
+    except Exception as e:
+        return False, {"error": str(e)[:80], "provider": "siliconflow"}
+
 
 def query_siliconflow_balance():
     """查询 API 账户余额（支持 deepseek / siliconflow）。返回 (成功标志, 消息文本)"""
@@ -449,17 +548,21 @@ def route_model(question: str) -> str:
         return "reasoning"
     return "math"
 
-def resolve_model(choice: str, question: str):
-    """根据用户选择（auto/reasoning/math）+ 题目，返回 (带工具模型, 纯文本模型, 模型显示名)。"""
+def resolve_model(choice: str, question: str, math_model=None):
+    """根据用户选择（auto/reasoning/math）+ 题目，返回 (带工具模型, 纯文本模型, 模型显示名)。
+    math_model：临时覆盖数学模型名（None/空 = 用 .env 的 MATH_MODEL）。"""
+    name = (math_model or "").strip() or _MATH_MODEL_NAME
     if choice == "reasoning":
         return llm_with_tools, llm, "DeepSeek-R1（推理模型）"
     if choice == "math":
-        return _ensure_llm_math_with_tools(), _ensure_llm_math(), f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}）"
+        return (_ensure_llm_math_with_tools(name), _ensure_llm_math(name),
+                f"数学模型（{_MATH_PROVIDER}:{name}）")
     # auto
     routed = route_model(question)
     if routed == "reasoning":
         return llm_with_tools, llm, "DeepSeek-R1（推理模型·自动）"
-    return _ensure_llm_math_with_tools(), _ensure_llm_math(), f"数学模型（{_MATH_PROVIDER}:{_MATH_MODEL_NAME}·自动）"
+    return (_ensure_llm_math_with_tools(name), _ensure_llm_math(name),
+            f"数学模型（{_MATH_PROVIDER}:{name}·自动）")
 
 def get_llm_for_choice(choice: str, default: str = "llm"):
     """根据 model_choice 返回 (LLM实例, 显示名)，用于直接调用 .invoke() 的场景（非图模式）。
@@ -1087,7 +1190,7 @@ def solve_agent(state: SolveState):
     messages.append({"role": "user", "content": user_content})
     # 按题型自动路由 / 手动选择模型
     choice = state.get("model_choice", "auto")
-    model_tools, model_plain, model_name = resolve_model(choice, user_content)
+    model_tools, model_plain, model_name = resolve_model(choice, user_content, state.get("math_model"))
     use_tools = tool_rounds < _MAX_TOOL_ROUNDS
     if not use_tools:
         # 工具预算用尽：摘掉工具强制收敛，保证一定给出最终答案
@@ -1125,7 +1228,7 @@ def checker_agent(state: SolveState):
 - 步骤详略适中（一般 3～8 步），不写与解题无关的文字。最后给出【答案】汇总各小问结论。
 """
     choice = state.get("model_choice", "auto")
-    _, model_plain, model_name = resolve_model(choice, user_content)
+    _, model_plain, model_name = resolve_model(choice, user_content, state.get("math_model"))
     resp, model_name = _invoke_llm(None, model_plain, [{"role": "user", "content": check_prompt}], False, model_name)
     _accumulate_usage(resp)
     return {"messages": [resp], "model_used": model_name}
@@ -1149,14 +1252,17 @@ def clean_model_answer(text: str) -> str:
     return '\n'.join(lines).strip()
 
 
-def run_question(graph, question: str, config, max_tries: int = 2, model_choice: str = "auto"):
+def run_question(graph, question: str, config, max_tries: int = 2, model_choice: str = "auto",
+                 math_model=None):
     """统一答题入口：调用图解题并清洗输出；若模型只输出推理、正文为空，自动重试。
-    model_choice: "auto"(按题型自动路由) / "reasoning"(DeepSeek) / "math"(Qwen数学)。
+    model_choice: "auto"(按题型自动路由) / "reasoning"(本地推理) / "math"(数学模型)。
+    math_model: 临时覆盖数学模型名（None=用 .env 的 MATH_MODEL）。
     返回 (清洗后答案, 实际使用的模型名)。"""
     ans = ""
     model_used = "未知"
     cfg = dict(config or {})
     cfg.setdefault("recursion_limit", _RECURSION_LIMIT)
+    t_start = time.time()
     # 云端预算护栏：选数学模型、或 auto 会路由到数学模型时，先看今日已花多少
     effective = model_choice if model_choice in ("math", "reasoning") else route_model(question)
     if effective == "math":
@@ -1167,7 +1273,9 @@ def run_question(graph, question: str, config, max_tries: int = 2, model_choice:
         try:
             _reset_usage_acc()
             res = graph.invoke(
-                {"messages": [{"role": "user", "content": question}], "model_choice": model_choice},
+                {"messages": [{"role": "user", "content": question}],
+                 "model_choice": model_choice,
+                 "math_model": (math_model or "")},
                 config=cfg)
         except GraphRecursionError:
             raise RuntimeError(
@@ -1177,8 +1285,15 @@ def run_question(graph, question: str, config, max_tries: int = 2, model_choice:
         model_used = res.get("model_used", "未知")
         if len(ans) >= 20:
             # 只有真正走了云端数学模型才计费（此前判断的是 siliconflow 字符串，切到 deepseek 后停止计数）
+            cost = 0.0
             if _MATH_PROVIDER in ("siliconflow", "deepseek") and "数学模型" in (model_used or ""):
-                record_api_usage(_USAGE_ACC["prompt"], _USAGE_ACC["completion"])
+                cost = record_api_usage(_USAGE_ACC["prompt"], _USAGE_ACC["completion"])
+            _LAST_RUN_STATS.update({
+                "prompt": _USAGE_ACC["prompt"],
+                "completion": _USAGE_ACC["completion"],
+                "cost": round(cost or 0.0, 4),
+                "seconds": round(time.time() - t_start, 1),
+            })
             return ans, model_used
         print(f"⚠️ 本次未生成有效答案（模型可能只输出了推理过程），第{attempt + 1}次重试中...")
     return ans, model_used
@@ -1741,9 +1856,11 @@ def _is_exam_question(text: str) -> bool:
     return True
 
 
-def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resume=True):
+def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resume=True,
+                     math_model=None):
     """批量解答一份试卷。支持断点续跑：每解完一题自动保存进度，中断后重新运行会跳过已完成的题。
-    model_choice: auto/reasoning/math；resume: True=读取进度续跑，False=从头开始。"""
+    model_choice: auto/reasoning/math；resume: True=读取进度续跑，False=从头开始。
+    math_model: 临时指定数学模型（如 deepseek-flash 省钱档），None=用 .env 的 MATH_MODEL。"""
     def _report(msg):
         if progress_cb is not None:
             try:
@@ -1790,7 +1907,8 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
         _report("正在解答第 " + str(idx+1) + "/" + str(len(q_list)) + " 题：" + q[:30] + "...")
         print("\n====批量处理第" + str(idx+1) + "题====\n题目：" + q[:80])
         try:
-            ans_text, _model_used = run_question(graph_chat, q, config, model_choice=model_choice)
+            ans_text, _model_used = run_question(graph_chat, q, config, model_choice=model_choice,
+                                                 math_model=math_model)
         except Exception as e:
             ans_text = "[本题解答出错：" + type(e).__name__ + "]"
             _report("第" + str(idx+1) + "题出错，已记录并继续")
@@ -1827,7 +1945,9 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
                 _report("重做第" + str(qno) + "题：" + q[:30] + "...")
                 print("\n====重做第" + str(qno) + "题====\n题目：" + q[:80])
                 try:
-                    retry_ans, _retry_model = run_question(graph_chat, q, config, max_tries=3, model_choice=model_choice)
+                    retry_ans, _retry_model = run_question(graph_chat, q, config, max_tries=3,
+                                                           model_choice=model_choice,
+                                                           math_model=math_model)
                     if len(retry_ans) >= 20 and not retry_ans.startswith("[本题解答出错"):
                         it["answer"] = retry_ans
                         it["success"] = True
