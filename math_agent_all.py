@@ -1203,6 +1203,12 @@ _LATEX_SYMBOL_MAP = {
     'ge': '≥', 'le': '≤', 'neq': '≠', 'to': '→', 'rightarrow': '→',
     'in': '∈', 'pi': 'π', 'pm': '±', 'times': '×', 'div': '÷',
     'mid': '|', 'cdot': '*', 'implies': '=>', 'infty': '∞',
+    # 集合 / 逻辑 / 几何常用符号（此前会被当作未知命令直接丢弃）
+    'cup': '∪', 'cap': '∩', 'subset': '⊂', 'subseteq': '⊆', 'supset': '⊃',
+    'emptyset': '∅', 'varnothing': '∅', 'complement': '∁',
+    'forall': '∀', 'exists': '∃', 'therefore': '∴', 'because': '∵',
+    'angle': '∠', 'perp': '⊥', 'parallel': '∥', 'triangle': '△', 'circ': '°',
+    'approx': '≈', 'sim': '∼', 'cong': '≌', 'leq': '≤', 'geq': '≥',
     'text': '', 'mathrm': '', 'operatorname': '', 'quad': '  ', 'qquad': '  ',
     'left': '', 'right': '', 'big': '', 'Big': '', 'bigg': '', 'Bigg': '',
 }
@@ -1221,6 +1227,14 @@ def latex_to_plain(s: str) -> str:
                 j += 1
             cmd = s[i + 1:j]
             low = cmd.lower()
+            # 转义字符：\{ \} \& \% 等，直接输出该字符本身
+            if cmd == '':
+                if j < n and s[j] in '{}%&$#_':
+                    out.append(s[j])
+                    i = j + 1
+                else:
+                    i = j
+                continue
             # \frac{a}{b} / \dfrac{a}{b} / \tfrac{a}{b}
             if low in ('frac', 'dfrac', 'tfrac', 'cfrac'):
                 num = den = ''
@@ -1259,15 +1273,40 @@ def latex_to_plain(s: str) -> str:
                     out.append(latex_to_plain(s[k + 1:e]))
                     i = e + 1
                     continue
+            # 只包裹文字的命令：\text{解} / \mathrm{d} / \operatorname{arg} → 保留内容、去掉花括号
+            if low in ("text", "mathrm", "mathbf", "mathit", "textbf", "textit", "operatorname"):
+                k = j
+                while k < n and s[k] == ' ':
+                    k += 1
+                if k < n and s[k] == '{':
+                    e = _find_matching_brace(s, k)
+                    out.append(latex_to_plain(s[k + 1:e]))
+                    i = e + 1
+                else:
+                    i = j
+                continue
             # 其它已知命令
             if low in _LATEX_SYMBOL_MAP:
                 out.append(_LATEX_SYMBOL_MAP[low])
                 i = j
                 continue
-            # 未知命令：丢弃
-            i = j
+            # 未知命令：跳过命令名；若后面紧跟 {...}，保留括号里的内容
+            # （\text{解} → 解、\mathrm{d} → d、\vec{a} → a，而不是把内容和花括号一起丢掉）
+            k = j
+            while k < n and s[k] == ' ':
+                k += 1
+            if k < n and s[k] == '{':
+                e = _find_matching_brace(s, k)
+                out.append(latex_to_plain(s[k + 1:e]))
+                i = e + 1
+            else:
+                i = j
             continue
         elif c == '{' or c == '}':
+            # 集合/解集记法必须原样保留：
+            # 此前这里一律丢弃花括号，导致「解集为 {x | 2<x<3}」变成「x | 2<x<3」，
+            # 集合题答案在网页与导出的 Word 里都会失真。
+            out.append(c)
             i += 1
             continue
         elif c == '^':
@@ -1278,6 +1317,16 @@ def latex_to_plain(s: str) -> str:
                 e = _find_matching_brace(s, k)
                 sup = latex_to_plain(s[k + 1:e])
                 i = e + 1
+            elif k < n and s[k] == '\\':
+                # 角度记法 60^\circ → 60°
+                j2 = k + 1
+                while j2 < n and s[j2].isalpha():
+                    j2 += 1
+                mapped = _LATEX_SYMBOL_MAP.get(s[k + 1:j2].lower())
+                if mapped:
+                    out.append(mapped)
+                i = j2
+                continue
             else:
                 sup = s[k] if k < n else ''
                 i = k + 1
