@@ -620,17 +620,14 @@ def build_rag_vector_db():
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
     chunks = splitter.split_text(full_doc)
-    from langchain_ollama import OllamaEmbeddings
     from langchain_chroma import Chroma
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    db = Chroma.from_texts(chunks, embedding=embeddings, persist_directory=CHROMA_DB_PATH)
+    db = Chroma.from_texts(chunks, embedding=_get_embeddings(), persist_directory=CHROMA_DB_PATH)
     print("✅RAG向量知识库构建完成，支持格式：txt/md/docx/pdf")
     return db
 
 def load_rag_db():
-    from langchain_ollama import OllamaEmbeddings
     from langchain_chroma import Chroma
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    embeddings = _get_embeddings()
     if os.path.exists(CHROMA_DB_PATH) and len(os.listdir(CHROMA_DB_PATH)) > 0:
         db = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embeddings)
         return db
@@ -824,8 +821,31 @@ def build_wiki(progress_cb=None, model_choice="auto", should_stop=None):
     return all_items
 
 
+# ========================嵌入模型（中文优先，自动回退）========================
+_EMB = {"obj": None}
+
+
+def _get_embeddings():
+    """优先用中文向 embedding（bge-m3），不可用时回退 nomic-embed-text。
+    nomic 对中文数学文本排序基本失效，只作兜底。"""
+    if _EMB["obj"] is not None:
+        return _EMB["obj"]
+    from langchain_ollama import OllamaEmbeddings
+    names = [os.getenv("EMBED_MODEL", "bge-m3"), "nomic-embed-text"]
+    for name in names:
+        try:
+            emb = OllamaEmbeddings(model=name)
+            emb.embed_query("检索测试")   # 触发加载，确认模型真的可用
+            _EMB["obj"] = emb
+            print(f"[嵌入] 使用 {name}")
+            return emb
+        except Exception as e:
+            print(f"[嵌入] {name} 不可用（{str(e)[:60]}），尝试下一个")
+    raise RuntimeError("没有可用的 embedding 模型（请 ollama pull bge-m3）")
+
+
 def _index_wiki_db():
-    """把 wiki 词条页内容建入 Chroma，供查询检索"""
+    """把 wiki 词条页内容建入 Chroma，供查询检索（重建前清空，避免重复累积）"""
     wiki_root = Path(WIKI_FOLDER)
     pages = sorted(p for p in wiki_root.rglob("*.md") if p.name != "index.md")
     texts, metas = [], []
@@ -834,10 +854,11 @@ def _index_wiki_db():
         metas.append(str(p))
     if not texts:
         return None
-    from langchain_ollama import OllamaEmbeddings
     from langchain_chroma import Chroma
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    db = Chroma.from_texts(texts, embedding=embeddings,
+    if os.path.exists(WIKI_DB_PATH):
+        import shutil as _shutil
+        _shutil.rmtree(WIKI_DB_PATH, ignore_errors=True)
+    db = Chroma.from_texts(texts, embedding=_get_embeddings(),
                            metadatas=[{"page": m} for m in metas],
                            persist_directory=WIKI_DB_PATH)
     return db
@@ -857,9 +878,13 @@ def _query_tokens(query: str):
 
 
 def wiki_retrieve(query: str, k: int = 3):
-    """Karpathy 查询：直接从编译好的 wiki 词条检索。
-    关键词打分（标题权重高）优先 + 向量检索补充，符合“直接读 Wiki”思想。
-    未编译/失败返回 None（由调用方回退 RAG）。"""
+    """Karpathy 查询：混合检索（关键词打分 + 向量相似度加权融合）。
+
+    - 关键词分：标题命中权重 3、正文命中权重 1（中文按 2~3 字 n-gram）
+    - 向量分：Chroma + nomic-embed-text，距离转相似度 1/(1+d)
+    - 最终分 = (1-w) * 关键词归一化 + w * 向量相似度，w 由 RAG_VEC_WEIGHT 控制（默认 0.5）
+    - RAG_HYBRID=off 时退回纯关键词
+    未编译/失败返回 None（由调用方回退旧 RAG）。"""
     meta_path = Path(WIKI_FOLDER) / "_meta.json"
     if not meta_path.exists():
         return None
@@ -871,39 +896,87 @@ def wiki_retrieve(query: str, k: int = 3):
             page_data.append({"title": p.stem, "text": text, "page": str(p)})
         if not page_data:
             return None
-        # 1) 关键词打分：命中标题权重 3，命中正文权重 1（n-gram 拆分中文查询）
+
+        # 1) 关键词打分（归一化到 0~1）
         keywords = _query_tokens(query)
-        scored = []
+        kw = {}
         for pd in page_data:
-            score = 0
+            s = 0
             for w in keywords:
                 if w in pd["title"]:
-                    score += 3
+                    s += 3
                 if w in pd["text"]:
-                    score += 1
-            scored.append((score, pd))
-        scored.sort(key=lambda x: -x[0])
-        top = [pd for s, pd in scored if s > 0][:k]
-        # 2) 关键词命中不足时，用向量检索补充
-        if len(top) < k:
+                    s += 1
+            kw[pd["page"]] = s
+        max_kw = max(kw.values()) or 1
+
+        # 2) 向量检索（失败不影响关键词结果）
+        vec = {}
+        hybrid_on = os.getenv("RAG_HYBRID", "on").lower() in ("1", "true", "on", "yes")
+        if hybrid_on:
             try:
-                from langchain_ollama import OllamaEmbeddings
                 from langchain_chroma import Chroma
-                embeddings = OllamaEmbeddings(model="nomic-embed-text")
-                if os.path.exists(WIKI_DB_PATH) and len(os.listdir(WIKI_DB_PATH)) > 0:
-                    db = Chroma(persist_directory=WIKI_DB_PATH, embedding_function=embeddings)
-                else:
-                    db = _index_wiki_db()
-                if db is not None:
-                    for d in db.similarity_search(query, k=k):
-                        if len(top) >= k:
-                            break
-                        pg = d.metadata.get("page", "")
-                        if pg and not any(pd["page"] == pg for pd in top):
-                            top.append({"title": Path(pg).stem,
-                                        "text": d.page_content, "page": pg})
+                emb = _get_embeddings()
+                model_tag = getattr(emb, "model", "") or ""
+                # nomic-embed-text 对中文数学文本排序不可靠，默认不参与融合（可 RAG_HYBRID_FORCE=on 强制）
+                weak = "nomic" in model_tag.lower()
+                if weak and os.getenv("RAG_HYBRID_FORCE", "off").lower() not in ("1", "true", "on", "yes"):
+                    print(f"[检索] 嵌入模型 {model_tag} 中文效果有限，本次按纯关键词检索"
+                          f"（ollama pull bge-m3 后自动启用混合检索）")
+                    hybrid_on = False
             except Exception as e:
-                print(f"wiki向量补充检索失败：{e}")
+                print(f"wiki 向量检索不可用，本次退回纯关键词：{str(e)[:80]}")
+                hybrid_on = False
+        if hybrid_on:
+            try:
+                from langchain_chroma import Chroma
+                emb = _get_embeddings()
+                model_tag = getattr(emb, "model", "") or ""
+                marker = Path(WIKI_DB_PATH) / "_embed_model.txt"
+                have_db = os.path.exists(WIKI_DB_PATH) and bool(os.listdir(WIKI_DB_PATH))
+                old_tag = ""
+                if have_db and marker.exists():
+                    try:
+                        old_tag = marker.read_text(encoding="utf-8").strip()
+                    except Exception:
+                        old_tag = ""
+                if (not have_db) or old_tag != model_tag:
+                    db = _index_wiki_db()
+                    try:
+                        marker.write_text(model_tag, encoding="utf-8")
+                    except Exception:
+                        pass
+                else:
+                    db = Chroma(persist_directory=WIKI_DB_PATH, embedding_function=emb)
+                if db is not None:
+                    for doc, dist in db.similarity_search_with_score(query, k=max(k * 3, 8)):
+                        pg = (doc.metadata or {}).get("page", "")
+                        if pg:
+                            vec[pg] = 1.0 / (1.0 + float(dist))
+            except Exception as e:
+                print(f"wiki 向量检索不可用，本次退回纯关键词：{str(e)[:80]}")
+
+        # 3) 融合：有词面命中时只在命中词条内用向量精排；全无命中才交给向量兜底召回
+        try:
+            w_vec = float(os.getenv("RAG_VEC_WEIGHT", "0.3") or 0.3)
+        except ValueError:
+            w_vec = 0.3
+        w_vec = min(max(w_vec, 0.0), 1.0)
+        w_kw = 1.0 - w_vec
+
+        has_kw_hits = any(v > 0 for v in kw.values())
+        candidates = [pd for pd in page_data if kw.get(pd["page"], 0) > 0] if has_kw_hits else page_data
+
+        ranked = []
+        for pd in candidates:
+            kscore = kw.get(pd["page"], 0) / max_kw
+            vscore = vec.get(pd["page"], 0.0)
+            final = w_kw * kscore + w_vec * vscore
+            if final > 0:
+                ranked.append((final, pd))
+        ranked.sort(key=lambda x: -x[0])
+
+        top = [pd for _s, pd in ranked[:k]]
         if not top:
             return None
         context = "\n====[LLM Wiki 知识词条]====\n"
@@ -2202,6 +2275,38 @@ def _safe_json_loads(s: str):
         return None
 
 
+def _dump_research_partial(fname, items, with_docx=False):
+    """把当前教研进度写成过程稿（md，可选再导一份 docx）。
+    长任务中途也有可交付物；中途停止或崩溃也不会丢掉已分析的题目。"""
+    try:
+        d = Path(OUT_RESEARCH_FOLDER) / "教研过程"
+        d.mkdir(parents=True, exist_ok=True)
+        stem = re.sub(r'[\\/:*?"<>|]', "_", Path(fname).stem)
+        md = [f"# 教研过程稿：{fname}", "",
+              f"- 更新时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+              f"- 累计已分析：**{len(items)}** 道（后续题目会继续追加）", ""]
+        for it in items:
+            md += [f"## 【{it.get('category', '未分类')}】{(it.get('question') or '')[:60]}", "",
+                   it.get("research_content", ""), "", "---", ""]
+        text = "\n".join(md)
+        md_path = d / f"{stem}_过程稿.md"
+        md_path.write_text(text, encoding="utf-8")
+        (d / "_进度.json").write_text(json.dumps({
+            "file": fname,
+            "items": len(items),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "partial": md_path.name,
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+        if with_docx and items:
+            try:
+                convert_md_to_docx(text, output_folder=str(d), out_name=f"{stem}_过程稿.docx")
+            except Exception:
+                pass
+        return str(md_path)
+    except Exception:
+        return None
+
+
 def research_workflow(only_files=None, progress_cb=None, model_choice="auto", should_stop=None):
     """教研汇总：从 raw_exam_files 提取题目并做教研分析。
     model_choice: auto/reasoning/math，控制题目提取和教研分析使用的模型"""
@@ -2264,7 +2369,10 @@ def research_workflow(only_files=None, progress_cb=None, model_choice="auto", sh
             except Exception as e:
                 _report(f"【{fname}】片段解析跳过 {e}")
             _report(f"【{fname}】第 {ci+1}/{len(valid_chunks)} 段完成")
-        _report(f"【{fname}】处理完成")
+            # 每分析完一段就落一份过程稿，长任务中途也有可交付物
+            _dump_research_partial(fname, all_research_items)
+        _dump_research_partial(fname, all_research_items, with_docx=True)
+        _report(f"【{fname}】处理完成，过程稿已更新（output_research/教研过程/）")
     #导出word
     doc = Document()
     doc.add_heading("高考数学真题教研资料", level=1)

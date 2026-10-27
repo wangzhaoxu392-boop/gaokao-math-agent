@@ -1012,7 +1012,8 @@ with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
         # ========== ④ 真题教研 ==========
         with gr.Tab("④ 真题教研"):
             gr.Markdown("真题 → 教研资料：标准答案 / 详细解答 / 第二种解法 / 易错点 / 命题特点 / 一题三变。"
-                        "整份试卷约 1~4 小时，建议先用单份试跑。")
+                        "整份试卷约 1~4 小时，**每分析完一段都会落一份过程稿**到 "
+                        "`output_research/教研过程/`，中途停止或中断也不丢已分析内容。")
             exam_file = gr.Dropdown(
                 label="选择 raw_exam_files 中的真题（可多选）", multiselect=True,
                 allow_custom_value=True,
