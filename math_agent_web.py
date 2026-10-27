@@ -9,6 +9,7 @@ r"""
 """
 import os
 import io
+import json
 import time
 import shutil
 import threading
@@ -132,6 +133,10 @@ def solve_one(question, model_choice):
     stats = (f"⏱ 本题 {dt:.0f} 秒 · 模型 `{model_used}` · "
              f"输入 {st.get('prompt', 0):,} / 输出 {st.get('completion', 0):,} token · "
              f"约 ¥{st.get('cost', 0):.4f}")
+    try:
+        _append_history(question, ans, model_used, st, dt)
+    except Exception:
+        pass
     yield f"（本题用时 {dt:.0f} 秒，使用模型：{model_used}）\n\n{ans}", img, stats
 
 
@@ -266,13 +271,14 @@ def upload_batch(files):
 
 def run_batch(files, model_choice="auto", math_model=""):
     if not files:
-        yield "请先选择试卷文件。", None
+        yield "请先选择试卷文件。", None, None
         return
     tier = math_model or "标准"
-    yield f"⏳ 批量做题启动中（模型档位：{tier}，每题约需数分钟），下方实时显示进度...\n", None
+    yield f"⏳ 批量做题启动中（模型档位：{tier}，每题约需数分钟），下方实时显示进度...\n", None, None
     progress = []
     done = threading.Event()
     result = {}
+    rows = []
 
     def worker():
         buf = io.StringIO()
@@ -285,7 +291,20 @@ def run_batch(files, model_choice="auto", math_model=""):
                         math_model=(math_model or None))
                     pdf_path = OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")
                     maa.text_to_pdf(full_text, str(pdf_path))
-                    progress.append(f"=== {fname} 完成，已生成 Word + PDF ===")
+                    st = dict(maa.LAST_BATCH_STATS or {})
+                    for it in st.get("items", []):
+                        rows.append([
+                            Path(fname).name,
+                            it.get("no"),
+                            "✅" if it.get("success") else "❌",
+                            (it.get("model") or "").split("（")[0][:18],
+                            f"{float(it.get('seconds') or 0):.0f}s",
+                            f"¥{float(it.get('cost') or 0):.4f}",
+                            f"{int(it.get('prompt') or 0):,}/{int(it.get('completion') or 0):,}",
+                        ])
+                    progress.append(
+                        f"=== {fname} 完成：{st.get('success', '?')} 题成功 / "
+                        f"{st.get('failed', '?')} 题失败，约 ¥{float(st.get('cost') or 0):.4f} ===")
         except Exception as e:
             progress.append(f"[错误] {e}")
         finally:
@@ -303,7 +322,7 @@ def run_batch(files, model_choice="auto", math_model=""):
         elapsed = int(time.time() - t_start)
         if elapsed >= 60:
             acc += f"⏱ 已运行 {elapsed//60} 分 {elapsed%60} 秒，仍在处理中请耐心等待\n"
-        yield acc, None
+        yield acc, None, None
         time.sleep(1.0)
     while seen < len(progress):
         acc += progress[seen] + "\n"
@@ -317,7 +336,9 @@ def run_batch(files, model_choice="auto", math_model=""):
                   OUTPUT_FOLDER / (Path(fname).stem + "_result.pdf")):
             if Path(p).exists():
                 outs.append(str(p))
-    yield f"✅ 批量做题完成！完整日志：\n{log}", (outs or None)
+    total_cost = sum(float(r[5].lstrip("¥")) for r in rows) if rows else 0.0
+    yield (f"✅ 批量做题完成！共 {len(rows)} 题，累计约 ¥{total_cost:.4f}。完整日志：\n{log}",
+           (outs or None), (rows or None))
 
 
 # ==================== 功能4：真题教研 ====================
@@ -653,214 +674,279 @@ def export_answer(answer_text, question):
         return None
 
 
+# ==================== 解题历史（持久化到 output/解题历史.json） ====================
+_HISTORY_FILE = OUTPUT_FOLDER / "解题历史.json"
+_HISTORY_MAX = 100
+_HIST_MAP = {}
+
+
+def _load_history():
+    try:
+        if _HISTORY_FILE.exists():
+            data = json.loads(_HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+
+def _append_history(question, answer, model, stats, seconds):
+    items = _load_history()
+    items.append({
+        "time": time.strftime("%m-%d %H:%M"),
+        "question": (question or "").strip(),
+        "answer": answer,
+        "model": model,
+        "seconds": round(float(seconds or 0), 1),
+        "prompt": int(stats.get("prompt") or 0),
+        "completion": int(stats.get("completion") or 0),
+        "cost": float(stats.get("cost") or 0),
+    })
+    try:
+        _HISTORY_FILE.write_text(
+            json.dumps(items[-_HISTORY_MAX:], ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def history_choices():
+    global _HIST_MAP
+    rev = list(reversed(_load_history()))
+    _HIST_MAP = {str(i): it for i, it in enumerate(rev)}
+    choices = []
+    for i, it in enumerate(rev):
+        q = (it.get("question") or "").replace("\n", " ")[:26]
+        choices.append((f"{it.get('time', '')} · {q} · {it.get('seconds', 0)}s", str(i)))
+    return choices, f"共 {len(rev)} 条历史记录（最多保留 {_HISTORY_MAX} 条）"
+
+
+def history_load(value):
+    it = _HIST_MAP.get(str(value)) if value is not None else None
+    if not it:
+        return gr.update(), gr.update(), "请先在下拉框里选择一条历史记录"
+    stats = (f"📚 历史记录 · 用时 {it.get('seconds', 0)} 秒 · 模型 `{it.get('model', '')}` · "
+             f"输入 {int(it.get('prompt') or 0):,} / 输出 {int(it.get('completion') or 0):,} token · "
+             f"约 ¥{float(it.get('cost') or 0):.4f}")
+    return it.get("question", ""), it.get("answer", ""), stats
+
+
+def history_clear():
+    try:
+        _HISTORY_FILE.write_text("[]", encoding="utf-8")
+    except Exception:
+        pass
+    return gr.update(choices=[], value=None), "已清空解题历史"
+
+
+def refresh_side():
+    """看板 + 历史列表一起刷新（供 15 秒定时器调用）"""
+    choices, info = history_choices()
+    return _dashboard_html(), gr.update(choices=choices), info
+
+
 # ==================== 网页界面 ====================
 with gr.Blocks(title="高考数学一体化Agent · 网页版") as demo:
-    gr.Markdown(f"""
-# 🧮 高考数学一体化Agent · 网页操作版
-{_ENGINE_DESC}
-""")
+    gr.Markdown(f"""# 🧮 高考数学一体化 Agent
+{_ENGINE_DESC}""")
 
-    # ---------- 顶部用量看板 ----------
+    # ---------- 顶部：用量看板 ----------
     dashboard = gr.HTML(_dashboard_html())
     with gr.Row():
         btn_refresh = gr.Button("🔄 刷新用量", scale=0, min_width=120)
-        btn_balance = gr.Button("📄 余额与用量明细", scale=0, min_width=170)
-    with gr.Accordion("用量明细（含 API 余额、累计 token、官网对账入口）", open=False):
+        btn_balance = gr.Button("📄 余额明细", scale=0, min_width=140)
+    with gr.Accordion("用量明细（API 余额 / 累计 token / 官网对账入口）", open=False):
         usage_detail = gr.Textbox(label="", lines=9, interactive=False, buttons=["copy"])
     btn_refresh.click(refresh_dashboard, outputs=[dashboard])
     btn_balance.click(balance_detail, outputs=[usage_detail])
-    # 15 秒轮询看板（读本地统计，余额走 300 秒缓存，不会频繁打接口）
+
+    with gr.Tabs():
+        # ========== ① 单题解题 ==========
+        with gr.Tab("① 单题解题"):
+            gr.Markdown("输入一道题 → 标准答案 + 逐步推导；支持追问、复制、导出 Word、查看历史。")
+            q_input = gr.Textbox(
+                label="题目（可含多小问；追问直接写“那它的极值呢”）",
+                lines=4, buttons=["copy"],
+                placeholder="例如：求函数 y = x^2 - 4x + 3 的单调区间和极值")
+            with gr.Row():
+                model_choice = gr.Dropdown(
+                    label="模型", scale=3, value="auto",
+                    choices=[("自动（按题型切换）", "auto"),
+                             (_REASON_LABEL, "reasoning"),
+                             (_MATH_LABEL, "math")])
+                btn_solve = gr.Button("开始解答", variant="primary", scale=1)
+                btn_clear = gr.Button("清空记忆", scale=1)
+            run_stats = gr.Markdown("")
+            out_text = gr.Textbox(label="解答结果", lines=18, interactive=False, buttons=["copy"])
+            with gr.Row():
+                btn_export = gr.Button("📄 导出 Word", scale=1, min_width=120)
+                export_file = gr.File(label="下载", scale=3)
+            out_plot = gr.Image(label="函数图像（题目需要绘图时自动出现）", type="filepath")
+            with gr.Accordion("📚 解题历史（最近 100 条，选中可载入重看）", open=False):
+                hist_dd = gr.Dropdown(label="历史记录", choices=history_choices()[0],
+                                      value=None, allow_custom_value=True)
+                with gr.Row():
+                    btn_hist_load = gr.Button("载入选中", scale=1)
+                    btn_hist_refresh = gr.Button("刷新列表", scale=1)
+                    btn_hist_clear = gr.Button("清空历史", scale=1)
+                hist_info = gr.Markdown("")
+
+            btn_solve.click(solve_one, inputs=[q_input, model_choice],
+                            outputs=[out_text, out_plot, run_stats])
+            btn_clear.click(clear_memory, outputs=[out_text])
+            btn_export.click(export_answer, inputs=[out_text, q_input], outputs=[export_file])
+            btn_hist_load.click(history_load, inputs=[hist_dd],
+                                outputs=[q_input, out_text, run_stats])
+            btn_hist_refresh.click(history_choices, outputs=[hist_dd, hist_info])
+            btn_hist_clear.click(history_clear, outputs=[hist_dd, hist_info])
+
+        # ========== ② 题目档案 ==========
+        with gr.Tab("② 题目档案"):
+            gr.Markdown("把一道题升级成题型：**11 字段档案**（考点/教材原型/两种解法/易错点/变式方向）"
+                        "+ **命题人视角 4 个变式**，可导出 Word。")
+            archive_q = gr.Textbox(
+                label="题目（建议粘贴完整题面，含参数与多小问）", lines=6, buttons=["copy"],
+                placeholder="例如：已知函数 f(x)=x³-3x²+ax，讨论其单调性与极值。")
+            with gr.Row():
+                archive_model = gr.Dropdown(
+                    label="分析模型", scale=3, value="math",
+                    choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning"), ("自动", "auto")])
+                btn_archive = gr.Button("① 题目档案", variant="primary", scale=1)
+                btn_variant = gr.Button("② 命题人变式", variant="primary", scale=1)
+                btn_archive_both = gr.Button("③ 档案+变式（推荐）", variant="secondary", scale=1)
+            archive_out = gr.Textbox(label="分析结果", lines=22, interactive=False, buttons=["copy"])
+            archive_dl = gr.File(label="下载 Word 文档（仅「档案+变式」生成）")
+            btn_archive.click(_run_archive, inputs=[archive_q, archive_model], outputs=[archive_out])
+            btn_variant.click(_run_variant, inputs=[archive_q, archive_model], outputs=[archive_out])
+            btn_archive_both.click(_run_archive_both, inputs=[archive_q, archive_model],
+                                   outputs=[archive_out, archive_dl])
+
+        # ========== ③ 批量做题 ==========
+        with gr.Tab("③ 批量做题"):
+            gr.Markdown("整卷逐题批改 → 输出 Word + PDF，并给出**逐题统计**（用时/费用/token）。"
+                        "余额有限时把「模型档位」切到省钱档。")
+            batch_file = gr.Dropdown(
+                label="选择 batch_input 中的试卷（可多选）", multiselect=True,
+                choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
+            with gr.Row():
+                batch_model = gr.Dropdown(
+                    label="解题模型", scale=2, value="auto",
+                    choices=[("自动（按题型切换）", "auto"),
+                             (_REASON_LABEL, "reasoning"),
+                             (_MATH_LABEL, "math")])
+                batch_tier = gr.Dropdown(label="模型档位", scale=1, choices=_MATH_TIERS, value="")
+                btn_refresh_b = gr.Button("刷新", scale=1, min_width=90)
+                btn_batch = gr.Button("开始批量做题", variant="primary", scale=1)
+            batch_upload = gr.File(label="上传试卷到 batch_input（txt/md/docx/pdf）", file_count="multiple")
+            batch_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
+            batch_log = gr.Textbox(label="处理日志", lines=10, interactive=False)
+            batch_table = gr.Dataframe(
+                label="逐题统计", interactive=False, wrap=True,
+                headers=["文件", "题号", "状态", "模型", "用时", "费用", "token 入/出"])
+            batch_dl = gr.File(label="下载解答文档（Word + PDF）")
+            batch_upload.upload(upload_batch, inputs=[batch_upload], outputs=[batch_msg, batch_file])
+            btn_refresh_b.click(refresh_batch, outputs=[batch_file])
+            btn_batch.click(run_batch, inputs=[batch_file, batch_model, batch_tier],
+                            outputs=[batch_log, batch_dl, batch_table])
+
+        # ========== ④ 真题教研 ==========
+        with gr.Tab("④ 真题教研"):
+            gr.Markdown("真题 → 教研资料：标准答案 / 详细解答 / 第二种解法 / 易错点 / 命题特点 / 一题三变。"
+                        "整份试卷约 1~4 小时，建议先用单份试跑。")
+            exam_file = gr.Dropdown(
+                label="选择 raw_exam_files 中的真题（可多选）", multiselect=True,
+                choices=_list_files(RAW_EXAM_FOLDER, (".pdf", ".docx")))
+            with gr.Row():
+                research_model = gr.Dropdown(
+                    label="分析模型", scale=3, value="auto",
+                    choices=[("自动（推理模型）", "auto"),
+                             (_REASON_LABEL, "reasoning"),
+                             (_MATH_LABEL, "math")])
+                btn_refresh_e = gr.Button("刷新", scale=1, min_width=90)
+                btn_research = gr.Button("开始真题教研", variant="primary", scale=1)
+            exam_upload = gr.File(label="上传真题到 raw_exam_files（pdf/docx）", file_count="multiple")
+            exam_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
+            exam_log = gr.Textbox(label="教研日志", lines=10, interactive=False)
+            exam_dl = gr.File(label="下载教研资料（Word + PDF）")
+            exam_upload.upload(upload_exam, inputs=[exam_upload], outputs=[exam_msg, exam_file])
+            btn_refresh_e.click(refresh_exam, outputs=[exam_file])
+            btn_research.click(run_research, inputs=[exam_file, research_model],
+                               outputs=[exam_log, exam_dl])
+
+        # ========== ⑤ 精细化讲义 ==========
+        with gr.Tab("⑤ 精细化讲义"):
+            gr.Markdown("按 **12 板块模板** 生成专题精讲讲义（概念/公式/四级题型/易错点/重难点/真题映射），"
+                        "自动导出 Word。学科 → 篇章 → 专题 三级联动。")
+            with gr.Row():
+                fine_subject = gr.Dropdown(label="学科", choices=fine_subjects(), value="数学", scale=1)
+                fine_category = gr.Dropdown(label="篇章", choices=fine_categories("数学"), value=None, scale=1)
+                fine_topic = gr.Dropdown(
+                    label="专题",
+                    choices=fine_topics("数学", list(maa.FINE_TOPICS["数学"].keys())[0]),
+                    value=None, scale=2)
+            with gr.Row():
+                fine_model = gr.Dropdown(
+                    label="生成模型", scale=3, value="math",
+                    choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning"), ("自动", "auto")])
+                btn_fine = gr.Button("生成讲义", variant="primary", scale=1)
+            fine_log = gr.Textbox(label="生成日志", lines=14, interactive=False)
+            fine_dl = gr.File(label="下载 Word 讲义")
+            fine_subject.change(_fine_update_cats, inputs=[fine_subject], outputs=[fine_category])
+            fine_category.change(_fine_update_topics, inputs=[fine_subject, fine_category], outputs=[fine_topic])
+            btn_fine.click(run_fine, inputs=[fine_subject, fine_category, fine_topic, fine_model],
+                           outputs=[fine_log, fine_dl])
+
+        # ========== ⑥ 知识库 ==========
+        with gr.Tab("⑥ 知识库"):
+            gr.Markdown("把 `knowledge_docs/` 里的资料**编译成 Wiki 词条**（分类/要点/交叉链接/索引），"
+                        "解题时自动检索；未编译则回退旧版向量库。")
+            wiki_status = gr.Textbox(label="Wiki 概况", value=_wiki_status(), interactive=False, lines=2)
+            kb_files = gr.Textbox(
+                label="knowledge_docs 现有文件", interactive=False,
+                value="、".join(_list_files(KNOWLEDGE_FOLDER)) or "（空）")
+            kb_upload = gr.File(label="上传资料（txt/md/docx/pdf）", file_count="multiple")
+            kb_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
+            with gr.Row():
+                wiki_model = gr.Dropdown(
+                    label="编译模型", scale=3, value="auto",
+                    choices=[("自动（快速模型）", "auto"),
+                             (_REASON_LABEL, "reasoning"),
+                             (_MATH_LABEL, "math")])
+                btn_wiki_build = gr.Button("编译 Wiki", variant="primary", scale=1)
+                btn_wiki_lint = gr.Button("自检", scale=1)
+                btn_wiki_heal = gr.Button("修复断链", scale=1)
+            kb_log = gr.Textbox(label="日志", lines=12, interactive=False)
+            with gr.Accordion("备选：重建旧版 RAG 向量库（未编译 Wiki 时回退用）", open=False):
+                btn_build_legacy = gr.Button("重建旧版向量库")
+            kb_upload.upload(upload_kb, inputs=[kb_upload], outputs=[kb_msg, kb_files])
+            btn_wiki_build.click(run_build_wiki, inputs=[wiki_model], outputs=[kb_log, wiki_status])
+            btn_wiki_lint.click(run_wiki_lint, outputs=[kb_log])
+            btn_wiki_heal.click(run_wiki_heal, outputs=[kb_log, wiki_status])
+            btn_build_legacy.click(build_kb, outputs=[kb_log])
+
+        # ========== ⑦ 格式转换 ==========
+        with gr.Tab("⑦ 格式转换"):
+            gr.Markdown("docx / pdf / txt → Markdown，Markdown → Word。适合把外部资料转成可入库/可教学的格式。")
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("**① 转 Markdown**")
+                    md_upload = gr.File(label="上传 docx / pdf / txt", file_count="single")
+                    btn_md_convert = gr.Button("转换为 MD", variant="primary")
+                    md_preview = gr.Textbox(label="预览", lines=10, interactive=False)
+                    md_dl = gr.File(label="下载 MD")
+                with gr.Column():
+                    gr.Markdown("**② 转 Word**")
+                    docx_upload = gr.File(label="上传 .md 文件", file_count="single")
+                    btn_docx_convert = gr.Button("转换为 Word", variant="primary")
+                    docx_preview = gr.Textbox(label="结果", lines=10, interactive=False)
+                    docx_dl = gr.File(label="下载 Word")
+            btn_md_convert.click(convert_to_md_ui, inputs=[md_upload], outputs=[md_preview, md_dl])
+            btn_docx_convert.click(convert_md_to_docx_ui, inputs=[docx_upload],
+                                   outputs=[docx_preview, docx_dl])
+
+    # 15 秒轮询：更新看板 + 解题历史列表（只读本地，余额走 300 秒缓存）
     _timer = gr.Timer(15)
-    _timer.tick(_dashboard_html, outputs=[dashboard])
-
-    # ---------- 功能1 ----------
-    with gr.Tab("① 单题交互"):
-        q_input = gr.Textbox(
-            label="题目（可含多小问；支持追问，如“那它的极值呢”）",
-            lines=4, placeholder="例如：求函数 y = x^2 - 4x + 3 的单调区间和极值",
-            buttons=["copy"])
-        with gr.Row():
-            model_choice = gr.Dropdown(
-                label="解题模型",
-                choices=[("自动（按题型切换）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
-                value="auto",
-                scale=2)
-            btn_solve = gr.Button("开始解答", variant="primary", scale=1)
-            btn_clear = gr.Button("清空记忆", scale=1)
-        run_stats = gr.Markdown("")
-        out_text = gr.Textbox(label="解答结果", lines=18, interactive=False, buttons=["copy"])
-        with gr.Row():
-            btn_export = gr.Button("📄 导出 Word", scale=1, min_width=120)
-            export_file = gr.File(label="下载 Word 文档", scale=3)
-        out_plot = gr.Image(label="函数图像（如有）", type="filepath", visible=True)
-        btn_solve.click(solve_one, inputs=[q_input, model_choice],
-                        outputs=[out_text, out_plot, run_stats])
-        btn_clear.click(clear_memory, outputs=[out_text])
-        btn_export.click(export_answer, inputs=[out_text, q_input], outputs=[export_file])
-
-    # ---------- 功能2 ----------
-    with gr.Tab("② LLM Wiki 知识库"):
-        gr.Markdown("""
-**Karpathy LLM Wiki 模式**：`knowledge_docs/` 是原始资料层（只进不改）。
-点击「编译 Wiki 知识库」后，LLM 会把资料**编译成结构化的 Markdown 词条**（分类 / 要点 / 交叉链接 / 总索引），
-解题时直接从编译好的 Wiki 检索（更快、知识可积累）；未编译时自动回退旧 RAG。
-""")
-        kb_files = gr.Textbox(
-            label="knowledge_docs 当前文件（原始资料层）",
-            value="、".join(_list_files(KNOWLEDGE_FOLDER)) or "（空）",
-            interactive=False)
-        kb_upload = gr.File(label="上传资料到 knowledge_docs（txt/md/docx/pdf）",
-                            file_count="multiple")
-        kb_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
-        with gr.Row():
-            wiki_model = gr.Dropdown(
-                label="编译模型",
-                choices=[("自动（快速模型）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
-                value="auto", scale=2)
-            btn_wiki_build = gr.Button("编译 Wiki 知识库", variant="primary", scale=1)
-            btn_wiki_lint = gr.Button("Wiki 自检", scale=1)
-            btn_wiki_heal = gr.Button("Wiki 修复（自动修断裂链接）", scale=1)
-        wiki_status = gr.Textbox(
-            label="Wiki 概况", value=_wiki_status(), interactive=False, lines=2)
-        kb_log = gr.Textbox(label="Wiki 日志", lines=12, interactive=False)
-        btn_build_legacy = gr.Button("重建旧版 RAG 向量库（备选，未编译 Wiki 时回退用）")
-        kb_upload.upload(upload_kb, inputs=[kb_upload],
-                         outputs=[kb_msg, kb_files])
-        btn_wiki_build.click(run_build_wiki, inputs=[wiki_model], outputs=[kb_log, wiki_status])
-        btn_wiki_lint.click(run_wiki_lint, outputs=[kb_log])
-        btn_wiki_heal.click(run_wiki_heal, outputs=[kb_log, wiki_status])
-        btn_build_legacy.click(build_kb, outputs=[kb_log])
-
-    # ---------- 功能3 ----------
-    with gr.Tab("③ 批量做题"):
-        gr.Markdown("余额有限时，把「模型档位」切到「省钱」可显著降低整卷成本（标准档更稳、更贵）。")
-        batch_file = gr.Dropdown(
-            label="选择 batch_input 中的试卷（可多选，一次处理多份）",
-            multiselect=True,
-            choices=_list_files(BATCH_INPUT_FOLDER, ALLOWED_BATCH))
-        with gr.Row():
-            batch_model = gr.Dropdown(
-                label="解题模型",
-                choices=[("自动（按题型切换）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
-                value="auto", scale=2)
-            batch_tier = gr.Dropdown(
-                label="模型档位",
-                choices=_MATH_TIERS, value="", scale=1)
-            btn_refresh_b = gr.Button("刷新列表", scale=1)
-            btn_batch = gr.Button("开始批量做题", variant="primary", scale=1)
-        batch_upload = gr.File(
-            label="上传试卷到 batch_input（txt/md/docx/pdf）", file_count="multiple")
-        batch_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
-        batch_log = gr.Textbox(label="处理日志", lines=12, interactive=False)
-        batch_dl = gr.File(label="下载解答文档（Word + PDF，可多份）")
-        batch_upload.upload(upload_batch, inputs=[batch_upload],
-                            outputs=[batch_msg, batch_file])
-        btn_refresh_b.click(refresh_batch, outputs=[batch_file])
-        btn_batch.click(run_batch, inputs=[batch_file, batch_model, batch_tier],
-                        outputs=[batch_log, batch_dl])
-
-    # ---------- 功能4 ----------
-    with gr.Tab("④ 真题教研"):
-        exam_file = gr.Dropdown(
-            label="选择 raw_exam_files 中的真题（可多选，只教研选中的文件）",
-            multiselect=True,
-            choices=_list_files(RAW_EXAM_FOLDER, (".pdf", ".docx")))
-        with gr.Row():
-            research_model = gr.Dropdown(
-                label="分析模型",
-                choices=[("自动（推理模型）", "auto"), (_REASON_LABEL, "reasoning"), (_MATH_LABEL, "math")],
-                value="auto", scale=2)
-            btn_refresh_e = gr.Button("刷新列表", scale=1)
-            btn_research = gr.Button("开始真题教研", variant="primary", scale=1)
-        exam_upload = gr.File(
-            label="上传真题到 raw_exam_files（pdf/docx）", file_count="multiple")
-        exam_msg = gr.Textbox(label="上传状态", interactive=False, lines=2)
-        exam_log = gr.Textbox(label="教研日志", lines=12, interactive=False)
-        exam_dl = gr.File(label="下载教研资料（Word + PDF）")
-        exam_upload.upload(upload_exam, inputs=[exam_upload],
-                           outputs=[exam_msg, exam_file])
-        btn_refresh_e.click(refresh_exam, outputs=[exam_file])
-        btn_research.click(run_research, inputs=[exam_file, research_model],
-                           outputs=[exam_log, exam_dl])
-
-    # ---------- 功能5：精细化内容生成 ----------
-    with gr.Tab("⑤ 精细化内容生成"):
-        gr.Markdown("""
-**按「学科通用精细化模板」（12板块）自动生成专题精讲讲义，可复用于数学/物理/化学等学科。**
-- 选择学科 → 篇章 → 专题，点击生成后由 LLM 按模板编写，自动导出 Word 文档（含核心概念、公式、ABCD四级题型与解析、易错点、重难点、真题映射）。
-- 生成文件保存在 `output_research/精细化内容/` 文件夹。
-""")
-        with gr.Row():
-            fine_subject = gr.Dropdown(
-                label="学科", choices=fine_subjects(), value="数学", scale=1)
-            fine_category = gr.Dropdown(
-                label="篇章", choices=fine_categories("数学"), value=None, scale=1)
-            fine_topic = gr.Dropdown(
-                label="专题", choices=fine_topics("数学", list(maa.FINE_TOPICS["数学"].keys())[0]),
-                value=None, scale=2)
-        with gr.Row():
-            fine_model = gr.Dropdown(
-                label="生成模型",
-                choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning"), ("自动", "auto")],
-                value="math", scale=2)
-            btn_fine = gr.Button("开始生成精细化讲义", variant="primary", scale=1)
-        fine_log = gr.Textbox(label="生成日志", lines=14, interactive=False)
-        fine_dl = gr.File(label="下载生成的 Word 讲义")
-        fine_subject.change(_fine_update_cats, inputs=[fine_subject], outputs=[fine_category])
-        fine_category.change(_fine_update_topics, inputs=[fine_subject, fine_category], outputs=[fine_topic])
-        btn_fine.click(run_fine, inputs=[fine_subject, fine_category, fine_topic, fine_model],
-                       outputs=[fine_log, fine_dl])
-
-    # ---------- 功能6：文件格式转换（MD↔Word 双向） ----------
-    with gr.Tab("⑥ 文件格式转换"):
-        gr.Markdown("""
-**文件格式互转：DOCX / PDF / TXT → Markdown，以及 Markdown → Word**
-- **① 转 MD**：上传 docx / pdf / txt → 输出 Markdown（保存在 `output_md/`）
-- **② 转 Word**：上传 .md 文件 → 输出 Word 文档（保存在 `output_md/`）
-""")
-        with gr.Group():
-            gr.Markdown("**① 转 MD（docx / pdf / txt → Markdown）**")
-            md_upload = gr.File(label="上传文件（docx/pdf/txt，单个文件）", file_count="single")
-            btn_md_convert = gr.Button("转换为 MD", variant="primary")
-            md_preview = gr.Textbox(label="MD 内容预览", lines=12, interactive=False)
-            md_dl = gr.File(label="下载 MD 文件")
-        with gr.Group():
-            gr.Markdown("**② 转 Word（Markdown → docx）**")
-            docx_upload = gr.File(label="上传 .md 文件（单个文件）", file_count="single")
-            btn_docx_convert = gr.Button("转换为 Word", variant="primary")
-            docx_preview = gr.Textbox(label="转换结果", lines=3, interactive=False)
-            docx_dl = gr.File(label="下载 Word 文件")
-        btn_md_convert.click(convert_to_md_ui, inputs=[md_upload],
-                              outputs=[md_preview, md_dl])
-        btn_docx_convert.click(convert_md_to_docx_ui, inputs=[docx_upload],
-                              outputs=[docx_preview, docx_dl])
-
-    # ---------- 功能7：题目档案 · 命题人变式 ----------
-    with gr.Tab("⑦ 题目档案·命题人变式"):
-        gr.Markdown("""
-**把「一道题」升级成「一个题型的生成机制」**
-- **① 题目档案**：原题→考查知识点→教材原型→解题入口→标准解法→第二解法→关键转折点→易错点→题型识别→可迁移方法→变式方向（11 字段）
-- **② 命题人视角改造**：拆解命题基因 → 生成 4 个完整变式 → 还原题型生成机制 → 备考启示
-- 建议用「③ 档案+变式」一次生成，并自动导出 Word 到 `output_research/题目档案/`
-""")
-        archive_q = gr.Textbox(
-            label="输入题目（建议粘贴完整题面，含参数与多小问）",
-            lines=6,
-            placeholder="例如：已知函数 f(x)=x³-3x²+ax，讨论其单调性与极值。")
-        with gr.Row():
-            archive_model = gr.Dropdown(
-                label="分析模型",
-                choices=[(_MATH_LABEL, "math"), (_REASON_LABEL, "reasoning"), ("自动", "auto")],
-                value="math", scale=2)
-            btn_archive = gr.Button("① 生成题目档案", variant="primary", scale=1)
-            btn_variant = gr.Button("② 命题人视角改造", variant="primary", scale=1)
-            btn_archive_both = gr.Button("③ 档案+变式（推荐）", variant="secondary", scale=1)
-        archive_out = gr.Textbox(label="分析结果", lines=24, interactive=False)
-        archive_dl = gr.File(label="下载 Word 文档（仅「档案+变式」生成）")
-        btn_archive.click(_run_archive, inputs=[archive_q, archive_model], outputs=[archive_out])
-        btn_variant.click(_run_variant, inputs=[archive_q, archive_model], outputs=[archive_out])
-        btn_archive_both.click(_run_archive_both, inputs=[archive_q, archive_model],
-                               outputs=[archive_out, archive_dl])
+    _timer.tick(refresh_side, outputs=[dashboard, hist_dd, hist_info])
 
 
 if __name__ == "__main__":

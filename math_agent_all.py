@@ -71,7 +71,7 @@ llm_fast = ChatOllama(
 # .env 配置：MATH_PROVIDER=ollama 或 siliconflow；MATH_MODEL=模型名
 # 【启动提速】延迟创建：首次使用数学模型时才导入 langchain_openai（该库导入约1秒），加快网页版启动
 _MATH_PROVIDER = os.getenv("MATH_PROVIDER", "ollama").lower()
-_MATH_MODEL_NAME = os.getenv("MATH_MODEL", "qwen2.5:14b")
+_MATH_MODEL_NAME = os.getenv("MATH_MODEL", "deepseek-r1:14b")
 _MATH_MAX_TOKENS = int(os.getenv("MATH_MAX_TOKENS", "3072") or 3072)
 llm_math = None
 llm_math_with_tools = None
@@ -217,6 +217,8 @@ def usage_snapshot():
 
 # 单次解题的消耗（网页端"本题用量"用）
 _LAST_RUN_STATS = {"prompt": 0, "completion": 0, "cost": 0.0, "seconds": 0.0}
+# 最近一次批量做题的逐题统计（网页端"结果统计"表用）
+LAST_BATCH_STATS = {}
 
 
 
@@ -1906,6 +1908,7 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
         q = q_list[idx]
         _report("正在解答第 " + str(idx+1) + "/" + str(len(q_list)) + " 题：" + q[:30] + "...")
         print("\n====批量处理第" + str(idx+1) + "题====\n题目：" + q[:80])
+        _model_used = ""
         try:
             ans_text, _model_used = run_question(graph_chat, q, config, model_choice=model_choice,
                                                  math_model=math_model)
@@ -1913,11 +1916,17 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
             ans_text = "[本题解答出错：" + type(e).__name__ + "]"
             _report("第" + str(idx+1) + "题出错，已记录并继续")
         is_error = ans_text.startswith("[本题解答出错")
+        _st = dict(_LAST_RUN_STATS)
         all_out_items.append({
             "no": idx+1,
             "question": q,
             "answer": ans_text,
-            "success": not is_error
+            "success": not is_error,
+            "model": _model_used,
+            "seconds": _st.get("seconds", 0),
+            "prompt": _st.get("prompt", 0),
+            "completion": _st.get("completion", 0),
+            "cost": _st.get("cost", 0),
         })
         if is_error:
             _report("第" + str(idx+1) + "题解答出错，已标记，继续下一题")
@@ -1952,6 +1961,11 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
                         it["answer"] = retry_ans
                         it["success"] = True
                         it["retry_fixed"] = True
+                        it["model"] = _retry_model
+                        it["seconds"] = _LAST_RUN_STATS.get("seconds", it.get("seconds", 0))
+                        it["prompt"] = _LAST_RUN_STATS.get("prompt", it.get("prompt", 0))
+                        it["completion"] = _LAST_RUN_STATS.get("completion", it.get("completion", 0))
+                        it["cost"] = _LAST_RUN_STATS.get("cost", it.get("cost", 0))
                         retry_fixed.append(str(qno))
                         _report("第" + str(qno) + "题重做成功！")
                     else:
@@ -1976,6 +1990,28 @@ def batch_solve_file(filename: str, progress_cb=None, model_choice="auto", resum
         _report("仍失败的题：" + "、".join(fail_nos) + "（已在文档末尾标注，建议手动检查）")
     else:
         _report("全部题目解答成功！")
+
+    # 供网页端"结果统计"表格使用（不含答案正文，避免体积过大）
+    LAST_BATCH_STATS.clear()
+    LAST_BATCH_STATS.update({
+        "filename": filename,
+        "total": len(all_out_items),
+        "success": success_count,
+        "failed": fail_count,
+        "cost": round(sum(float(it.get("cost") or 0) for it in all_out_items), 4),
+        "seconds": round(sum(float(it.get("seconds") or 0) for it in all_out_items), 1),
+        "prompt": sum(int(it.get("prompt") or 0) for it in all_out_items),
+        "completion": sum(int(it.get("completion") or 0) for it in all_out_items),
+        "items": [{
+            "no": it.get("no"),
+            "success": bool(it.get("success", True)),
+            "model": it.get("model", ""),
+            "seconds": float(it.get("seconds") or 0),
+            "cost": float(it.get("cost") or 0),
+            "prompt": int(it.get("prompt") or 0),
+            "completion": int(it.get("completion") or 0),
+        } for it in all_out_items],
+    })
 
     # 直接生成docx，不再生成md
     doc = Document()
